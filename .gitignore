@@ -1,0 +1,14 @@
+# gire all .bak files
+*.bak
+# ignore all csv and xlsx / xls files
+*.csv
+*.xlsx
+*.xls
+# ignore compress files
+*.zip
+*.rar
+*.7z
+#ignore .DS_STORE from MacOS
+.DS_Store
+#ignore .vscode/
+.vscode/
