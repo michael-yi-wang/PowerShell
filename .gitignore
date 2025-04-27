@@ -12,3 +12,5 @@
 .DS_Store
 #ignore .vscode/
 .vscode/
+# log files
+*.log
