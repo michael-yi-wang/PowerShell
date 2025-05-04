@@ -51,9 +51,9 @@ Connect-PnPOnline $SPAdminURL -ClientId $AppClientID -Tenant $TenantURL -Thumbpr
 
 #Get all site collections
 #Filter out the ones that are OneDrive for Business or SharePoint Admin sites
-$SiteCollections = Get-PnPTenantSite | Where-Object {$_.Url -notlike "*-my.sharepoint.com*" -and $_.Url -notlike "*-admin.sharepoint.com*"}
+$SiteCollections = Get-PnPTenantSite | Where-Object {$_.Template -notlike "TEAMCHANNEL*" -and $_.Url -notlike "*-my.sharepoint.com*" -and $_.Url -notlike "*-admin.sharepoint.com*"}
 
-
+Write-Host "Found $($SiteCollections.Count) sites." -ForegroundColor Green
 
 foreach ($Site in $SiteCollections) {
       $SiteURL = $Site.Url
