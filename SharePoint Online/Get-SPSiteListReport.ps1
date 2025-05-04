@@ -66,7 +66,7 @@ foreach ($Site in $SiteCollections) {
       #Get the data for the site
       $siteData = Get-PnPTenantSite -Identity $SiteURL
       #Get the recycle bin items for the site
-      $recycleBinData = Get-PnPRecycleBinItem -Connection $SiteConnection
+      $recycleBinData = Get-PnPRecycleBinItem -Connection $SiteConnection -ErrorAction SilentlyContinue
       #Sum up the size for all the recycle bin items
       $recycleBinSize = $recycleBinData | Measure-Object -Property Size -Sum | Select-Object -ExpandProperty Sum
 
