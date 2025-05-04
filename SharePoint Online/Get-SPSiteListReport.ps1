@@ -86,7 +86,7 @@ foreach ($Site in $SiteCollections) {
 
       #Get all lists with versioning enabled
       #Filter out the ones that are not document libraries or generic lists
-      $SiteLists=  Get-PnPList -Connection $SiteConnection | Where-Object {$_.EnableVersioning -eq $True -and ($_.BaseType -eq 'DocumentLibrary' -or $_.BaseType -eq 'GenericList')} -ErrorAction SilentlyContinue
+      $SiteLists=  Get-PnPList -Connection $SiteConnection -ErrorAction SilentlyContinue
       foreach ($List in $SiteLists) {
             #Create a custom object to store the result of a single list
             #This object will contain the site URL, list title, and versioning information
