@@ -44,6 +44,7 @@ Import-Module PnP.PowerShell
 $listFinalResult = @()
 $siteFinalResult = @()
 $currentDate = Get-Date -Format "yyyyMMdd"
+$count = 1
 
 #Connect to SharePoint Online using app-only authentication
 #This connection uses the client ID and thumbprint of the certificate to authenticate
@@ -59,7 +60,7 @@ foreach ($Site in $SiteCollections) {
       $SiteURL = $Site.Url
 
       #Output the current site being processed
-      Write-Host "Processing site: $SiteURL" -ForegroundColor Green
+      Write-Host "$count / $($SiteCollections.Count) Processing site: $SiteURL" -ForegroundColor Green
 
       #Connect to the individual site
       $SiteConnection = Connect-PnPOnline -Tenant $TenantURL -Url $SiteURL -ClientId $AppClientID -Thumbprint $CertThumbprint -ReturnConnection
@@ -104,7 +105,7 @@ foreach ($Site in $SiteCollections) {
             # Add the result entry to the final result array
             $listFinalResult += $listResultEntry
       }
-
+      $count++
       $siteFinalResult += $siteResultEntry
 }
 
