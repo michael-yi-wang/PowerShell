@@ -96,7 +96,7 @@ foreach ($Site in $SiteCollections) {
                   # Below item is to display the site URL
                   Site = $SiteURL
                   # Below items are to display each list under the above site
-                  AccessURL = "https://fshr.sharepoint.com" + $List.DefaultViewUrl
+                  AccessURL = $SPAdminURL + $List.DefaultViewUrl
                   ListTitle = $List.Title
                   EnableVersioning = $List.EnableVersioning
                   ObjectVersion = $List.ObjectVersion
