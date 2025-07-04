@@ -1,18 +1,14 @@
 <#
 .SYNOPSIS
-    Checks if users and groups from a CSV file exist in both on-premises Active Directory and Azure AD.
+    Checks if users and groups from a CSV file exist in both on-premises Active Directory and Entra ID.
 
 .DESCRIPTION
-    This script reads user and group objects from a CSV file and verifies their existence in both
-    on-premises Active Directory and Azure AD (Entra ID). It provides detailed reporting on the
-    existence status of each object.
+    This script reads user and group names from a CSV file and verifies their existence in both
+    on-premises Active Directory and Entra ID. It automatically detects whether each name is a user
+    or group and provides detailed reporting including DistinguishedName and ObjectId.
 
 .PARAMETER CsvPath
-    The path to the CSV file containing user and group objects to check.
-
-.PARAMETER ObjectTypeColumn
-    The name of the column in the CSV that indicates whether the object is a user or group.
-    Default is "ObjectType".
+    The path to the CSV file containing user and group names to check.
 
 .PARAMETER NameColumn
     The name of the column in the CSV that contains the user/group names to check.
@@ -27,29 +23,26 @@
     use existing connections.
 
 .EXAMPLE
-    .\Test-UserGroupExistence.ps1 -CsvPath "C:\Users\Administrator\Desktop\users_groups.csv"
+    .\Test-UserGroupExistence.ps1 -CsvPath "C:\Users\Administrator\Desktop\names.csv"
 
 .EXAMPLE
-    .\Test-UserGroupExistence.ps1 -CsvPath "C:\Users\Administrator\Desktop\users_groups.csv" -ConnectToAzureAD
+    .\Test-UserGroupExistence.ps1 -CsvPath "C:\Users\Administrator\Desktop\names.csv" -ConnectToAzureAD
 
 .NOTES
     Author: PowerShell Script
     Date: $(Get-Date -Format "yyyy-MM-dd")
-    Version: 1.0
+    Version: 2.0
     
     Requirements:
     - Active Directory PowerShell module
-    - Azure AD PowerShell module (if checking Azure AD)
-    - Appropriate permissions to query both on-premises AD and Azure AD
+    - Azure AD PowerShell module (if checking Entra ID)
+    - Appropriate permissions to query both on-premises AD and Entra ID
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true, HelpMessage = "Path to the CSV file containing user and group objects")]
+    [Parameter(Mandatory = $true, HelpMessage = "Path to the CSV file containing user and group names")]
     [string]$CsvPath,
-    
-    [Parameter(Mandatory = $false, HelpMessage = "Name of the column indicating object type (User/Group)")]
-    [string]$ObjectTypeColumn = "ObjectType",
     
     [Parameter(Mandatory = $false, HelpMessage = "Name of the column containing user/group names")]
     [string]$NameColumn = "Name",
@@ -70,78 +63,184 @@ function Write-ColorOutput {
     Write-Host $Message -ForegroundColor $Color
 }
 
-# Function to check if a user exists in on-premises AD
+# Function to check if a user exists in on-premises AD and return DistinguishedName
 function Test-OnPremUserExists {
     param([string]$UserName)
     
     try {
-        $user = Get-ADUser -Identity $UserName -ErrorAction Stop
-        return $true
+        $user = Get-ADUser -Identity $UserName -Properties DistinguishedName -ErrorAction Stop
+        return @{
+            Exists = $true
+            DistinguishedName = $user.DistinguishedName
+            ObjectType = "User"
+        }
     }
     catch {
-        return $false
+        return @{
+            Exists = $false
+            DistinguishedName = $null
+            ObjectType = $null
+        }
     }
 }
 
-# Function to check if a group exists in on-premises AD
+# Function to check if a group exists in on-premises AD and return DistinguishedName
 function Test-OnPremGroupExists {
     param([string]$GroupName)
     
     try {
-        $group = Get-ADGroup -Identity $GroupName -ErrorAction Stop
-        return $true
+        $group = Get-ADGroup -Identity $GroupName -Properties DistinguishedName -ErrorAction Stop
+        return @{
+            Exists = $true
+            DistinguishedName = $group.DistinguishedName
+            ObjectType = "Group"
+        }
     }
     catch {
-        return $false
+        return @{
+            Exists = $false
+            DistinguishedName = $null
+            ObjectType = $null
+        }
     }
 }
 
-# Function to check if a user exists in Azure AD
-function Test-AzureUserExists {
+# Function to detect and check if a name exists in on-premises AD (as user or group)
+function Test-OnPremExists {
+    param([string]$Name)
+    
+    # First try as user
+    $userResult = Test-OnPremUserExists -UserName $Name
+    if ($userResult.Exists) {
+        return $userResult
+    }
+    
+    # If not found as user, try as group
+    $groupResult = Test-OnPremGroupExists -GroupName $Name
+    if ($groupResult.Exists) {
+        return $groupResult
+    }
+    
+    # Not found as either
+    return @{
+        Exists = $false
+        DistinguishedName = $null
+        ObjectType = $null
+    }
+}
+
+# Function to check if a user exists in Entra ID and return ObjectId
+function Test-EntraUserExists {
     param([string]$UserName)
     
     try {
         $user = Get-AzureADUser -ObjectId $UserName -ErrorAction Stop
-        return $true
+        return @{
+            Exists = $true
+            ObjectId = $user.ObjectId
+            ObjectType = "User"
+        }
     }
     catch {
         try {
             # Try searching by UserPrincipalName
             $user = Get-AzureADUser -SearchString $UserName -ErrorAction Stop
-            if ($user) { return $true }
+            if ($user) { 
+                return @{
+                    Exists = $true
+                    ObjectId = $user.ObjectId
+                    ObjectType = "User"
+                }
+            }
         }
         catch {
             # Try searching by DisplayName
             try {
                 $user = Get-AzureADUser -All $true | Where-Object { $_.DisplayName -eq $UserName }
-                if ($user) { return $true }
+                if ($user) { 
+                    return @{
+                        Exists = $true
+                        ObjectId = $user.ObjectId
+                        ObjectType = "User"
+                    }
+                }
             }
             catch {
-                return $false
+                return @{
+                    Exists = $false
+                    ObjectId = $null
+                    ObjectType = $null
+                }
             }
         }
-        return $false
+        return @{
+            Exists = $false
+            ObjectId = $null
+            ObjectType = $null
+        }
     }
 }
 
-# Function to check if a group exists in Azure AD
-function Test-AzureGroupExists {
+# Function to check if a group exists in Entra ID and return ObjectId
+function Test-EntraGroupExists {
     param([string]$GroupName)
     
     try {
         $group = Get-AzureADGroup -ObjectId $GroupName -ErrorAction Stop
-        return $true
+        return @{
+            Exists = $true
+            ObjectId = $group.ObjectId
+            ObjectType = "Group"
+        }
     }
     catch {
         try {
             # Try searching by DisplayName
             $group = Get-AzureADGroup -SearchString $GroupName -ErrorAction Stop
-            if ($group) { return $true }
+            if ($group) { 
+                return @{
+                    Exists = $true
+                    ObjectId = $group.ObjectId
+                    ObjectType = "Group"
+                }
+            }
         }
         catch {
-            return $false
+            return @{
+                Exists = $false
+                ObjectId = $null
+                ObjectType = $null
+            }
         }
-        return $false
+        return @{
+            Exists = $false
+            ObjectId = $null
+            ObjectType = $null
+        }
+    }
+}
+
+# Function to detect and check if a name exists in Entra ID (as user or group)
+function Test-EntraExists {
+    param([string]$Name)
+    
+    # First try as user
+    $userResult = Test-EntraUserExists -UserName $Name
+    if ($userResult.Exists) {
+        return $userResult
+    }
+    
+    # If not found as user, try as group
+    $groupResult = Test-EntraGroupExists -GroupName $Name
+    if ($groupResult.Exists) {
+        return $groupResult
+    }
+    
+    # Not found as either
+    return @{
+        Exists = $false
+        ObjectId = $null
+        ObjectType = $null
     }
 }
 
@@ -159,13 +258,9 @@ try {
     
     # Import CSV file
     $csvData = Import-Csv -Path $CsvPath -ErrorAction Stop
-    Write-ColorOutput "Successfully imported $($csvData.Count) objects from CSV" "Green"
+    Write-ColorOutput "Successfully imported $($csvData.Count) names from CSV" "Green"
     
     # Validate CSV structure
-    if (-not $csvData[0].PSObject.Properties.Name.Contains($ObjectTypeColumn)) {
-        throw "Column '$ObjectTypeColumn' not found in CSV file. Available columns: $($csvData[0].PSObject.Properties.Name -join ', ')"
-    }
-    
     if (-not $csvData[0].PSObject.Properties.Name.Contains($NameColumn)) {
         throw "Column '$NameColumn' not found in CSV file. Available columns: $($csvData[0].PSObject.Properties.Name -join ', ')"
     }
@@ -180,37 +275,37 @@ try {
     Write-ColorOutput "Active Directory module loaded successfully" "Green"
     
     # Check Azure AD connection
-    Write-ColorOutput "Checking Azure AD connection..." "Yellow"
+    Write-ColorOutput "Checking Entra ID connection..." "Yellow"
     $azureConnected = $false
     
     try {
         $context = Get-AzureADCurrentSessionInfo -ErrorAction Stop
         if ($context) {
-            Write-ColorOutput "Already connected to Azure AD" "Green"
+            Write-ColorOutput "Already connected to Entra ID" "Green"
             $azureConnected = $true
         }
     }
     catch {
-        Write-ColorOutput "Not connected to Azure AD" "Yellow"
+        Write-ColorOutput "Not connected to Entra ID" "Yellow"
     }
     
     # Connect to Azure AD if needed
     if (-not $azureConnected) {
         if ($ConnectToAzureAD) {
-            Write-ColorOutput "Connecting to Azure AD..." "Yellow"
+            Write-ColorOutput "Connecting to Entra ID..." "Yellow"
             try {
                 Connect-AzureAD -ErrorAction Stop
-                Write-ColorOutput "Successfully connected to Azure AD" "Green"
+                Write-ColorOutput "Successfully connected to Entra ID" "Green"
                 $azureConnected = $true
             }
             catch {
-                Write-ColorOutput "Failed to connect to Azure AD. Azure AD checks will be skipped." "Red"
+                Write-ColorOutput "Failed to connect to Entra ID. Entra ID checks will be skipped." "Red"
                 $azureConnected = $false
             }
         }
         else {
-            Write-ColorOutput "Not connected to Azure AD. Use -ConnectToAzureAD parameter to connect." "Yellow"
-            Write-ColorOutput "Azure AD checks will be skipped." "Yellow"
+            Write-ColorOutput "Not connected to Entra ID. Use -ConnectToAzureAD parameter to connect." "Yellow"
+            Write-ColorOutput "Entra ID checks will be skipped." "Yellow"
         }
     }
     
@@ -221,69 +316,63 @@ try {
     Write-ColorOutput "Starting existence checks..." "Cyan"
     Write-ColorOutput "Progress: " -NoNewline
     
-    # Process each object in the CSV
-    foreach ($object in $csvData) {
+    # Process each name in the CSV
+    foreach ($row in $csvData) {
         $processedCount++
         $progress = [math]::Round(($processedCount / $csvData.Count) * 100, 1)
         Write-Progress -Activity "Checking object existence" -Status "Processing $processedCount of $($csvData.Count)" -PercentComplete $progress
         
-        $objectName = $object.$NameColumn
-        $objectType = $object.$ObjectTypeColumn
+        $objectName = $row.$NameColumn
         
         # Initialize result object
         $result = [PSCustomObject]@{
             Name = $objectName
-            ObjectType = $objectType
             OnPremExists = $null
-            AzureExists = $null
+            EntraExists = $null
+            OnPremObjectType = ""
+            EntraObjectType = ""
+            OnPremDistinguishedName = ""
+            EntraObjectId = ""
             OnPremDetails = ""
-            AzureDetails = ""
+            EntraDetails = ""
             Timestamp = Get-Date
         }
         
         # Check on-premises AD
         try {
-            if ($objectType -eq "User" -or $objectType -eq "user") {
-                $onPremExists = Test-OnPremUserExists -UserName $objectName
-                $result.OnPremExists = $onPremExists
-                $result.OnPremDetails = if ($onPremExists) { "User found in on-premises AD" } else { "User not found in on-premises AD" }
-            }
-            elseif ($objectType -eq "Group" -or $objectType -eq "group") {
-                $onPremExists = Test-OnPremGroupExists -GroupName $objectName
-                $result.OnPremExists = $onPremExists
-                $result.OnPremDetails = if ($onPremExists) { "Group found in on-premises AD" } else { "Group not found in on-premises AD" }
-            }
-            else {
-                $result.OnPremDetails = "Invalid object type specified"
+            $onPremResult = Test-OnPremExists -Name $objectName
+            $result.OnPremExists = $onPremResult.Exists
+            $result.OnPremObjectType = $onPremResult.ObjectType
+            $result.OnPremDistinguishedName = $onPremResult.DistinguishedName
+            $result.OnPremDetails = if ($onPremResult.Exists) { 
+                "$($onPremResult.ObjectType) found in on-premises AD" 
+            } else { 
+                "Not found in on-premises AD" 
             }
         }
         catch {
             $result.OnPremDetails = "Error checking on-premises AD: $($_.Exception.Message)"
         }
         
-        # Check Azure AD
+        # Check Entra ID
         if ($azureConnected) {
             try {
-                if ($objectType -eq "User" -or $objectType -eq "user") {
-                    $azureExists = Test-AzureUserExists -UserName $objectName
-                    $result.AzureExists = $azureExists
-                    $result.AzureDetails = if ($azureExists) { "User found in Azure AD" } else { "User not found in Azure AD" }
-                }
-                elseif ($objectType -eq "Group" -or $objectType -eq "group") {
-                    $azureExists = Test-AzureGroupExists -GroupName $objectName
-                    $result.AzureExists = $azureExists
-                    $result.AzureDetails = if ($azureExists) { "Group found in Azure AD" } else { "Group not found in Azure AD" }
-                }
-                else {
-                    $result.AzureDetails = "Invalid object type specified"
+                $entraResult = Test-EntraExists -Name $objectName
+                $result.EntraExists = $entraResult.Exists
+                $result.EntraObjectType = $entraResult.ObjectType
+                $result.EntraObjectId = $entraResult.ObjectId
+                $result.EntraDetails = if ($entraResult.Exists) { 
+                    "$($entraResult.ObjectType) found in Entra ID" 
+                } else { 
+                    "Not found in Entra ID" 
                 }
             }
             catch {
-                $result.AzureDetails = "Error checking Azure AD: $($_.Exception.Message)"
+                $result.EntraDetails = "Error checking Entra ID: $($_.Exception.Message)"
             }
         }
         else {
-            $result.AzureDetails = "Azure AD check skipped - not connected"
+            $result.EntraDetails = "Entra ID check skipped - not connected"
         }
         
         # Add result to array
@@ -310,19 +399,19 @@ try {
     Write-ColorOutput "On-premises AD - Found: $onPremFound, Not Found: $onPremNotFound, Errors: $onPremErrors" "White"
     
     if ($azureConnected) {
-        $azureFound = ($results | Where-Object { $_.AzureExists -eq $true }).Count
-        $azureNotFound = ($results | Where-Object { $_.AzureExists -eq $false }).Count
-        $azureErrors = ($results | Where-Object { $_.AzureExists -eq $null }).Count
+        $entraFound = ($results | Where-Object { $_.EntraExists -eq $true }).Count
+        $entraNotFound = ($results | Where-Object { $_.EntraExists -eq $false }).Count
+        $entraErrors = ($results | Where-Object { $_.EntraExists -eq $null }).Count
         
-        Write-ColorOutput "Azure AD - Found: $azureFound, Not Found: $azureNotFound, Errors: $azureErrors" "White"
+        Write-ColorOutput "Entra ID - Found: $entraFound, Not Found: $entraNotFound, Errors: $entraErrors" "White"
         
         # Objects missing from either environment
         $missingFromOnPrem = ($results | Where-Object { $_.OnPremExists -eq $false }).Count
-        $missingFromAzure = ($results | Where-Object { $_.AzureExists -eq $false }).Count
-        $missingFromBoth = ($results | Where-Object { $_.OnPremExists -eq $false -and $_.AzureExists -eq $false }).Count
+        $missingFromEntra = ($results | Where-Object { $_.EntraExists -eq $false }).Count
+        $missingFromBoth = ($results | Where-Object { $_.OnPremExists -eq $false -and $_.EntraExists -eq $false }).Count
         
         Write-ColorOutput "Missing from On-premises AD: $missingFromOnPrem" "Yellow"
-        Write-ColorOutput "Missing from Azure AD: $missingFromAzure" "Yellow"
+        Write-ColorOutput "Missing from Entra ID: $missingFromEntra" "Yellow"
         Write-ColorOutput "Missing from both: $missingFromBoth" "Red"
     }
     
@@ -334,15 +423,15 @@ try {
     # Display objects not found in either environment
     Write-ColorOutput "`n=== OBJECTS NOT FOUND ===" "Cyan"
     
-    $notFoundObjects = $results | Where-Object { $_.OnPremExists -eq $false -or $_.AzureExists -eq $false }
+    $notFoundObjects = $results | Where-Object { $_.OnPremExists -eq $false -or $_.EntraExists -eq $false }
     
     if ($notFoundObjects.Count -gt 0) {
         foreach ($obj in $notFoundObjects) {
             $status = @()
             if ($obj.OnPremExists -eq $false) { $status += "OnPrem" }
-            if ($obj.AzureExists -eq $false) { $status += "Azure" }
+            if ($obj.EntraExists -eq $false) { $status += "Entra" }
             
-            Write-ColorOutput "$($obj.Name) ($($obj.ObjectType)) - Missing from: $($status -join ', ')" "Red"
+            Write-ColorOutput "$($obj.Name) - Missing from: $($status -join ', ')" "Red"
         }
     }
     else {
