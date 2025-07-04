@@ -18,24 +18,24 @@
     The path where the results will be exported as a CSV file.
     Default is "UserGroupExistenceReport.csv" in the current directory.
 
-.PARAMETER ConnectToAzureAD
-    Switch parameter to connect to Azure AD. If not specified, the script will attempt to
+.PARAMETER ConnectToGraph
+    Switch parameter to connect to Microsoft Graph. If not specified, the script will attempt to
     use existing connections.
 
 .EXAMPLE
     .\Test-UserGroupExistence.ps1 -CsvPath "C:\Users\Administrator\Desktop\names.csv"
 
 .EXAMPLE
-    .\Test-UserGroupExistence.ps1 -CsvPath "C:\Users\Administrator\Desktop\names.csv" -ConnectToAzureAD
+    .\Test-UserGroupExistence.ps1 -CsvPath "C:\Users\Administrator\Desktop\names.csv" -ConnectToGraph
 
 .NOTES
     Author: PowerShell Script
     Date: $(Get-Date -Format "yyyy-MM-dd")
-    Version: 2.0
+    Version: 3.0
     
     Requirements:
     - Active Directory PowerShell module
-    - Azure AD PowerShell module (if checking Entra ID)
+    - Microsoft Graph PowerShell module (if checking Entra ID)
     - Appropriate permissions to query both on-premises AD and Entra ID
 #>
 
@@ -50,8 +50,8 @@ param(
     [Parameter(Mandatory = $false, HelpMessage = "Path for the output CSV report")]
     [string]$OutputPath = "UserGroupExistenceReport.csv",
     
-    [Parameter(Mandatory = $false, HelpMessage = "Connect to Azure AD if not already connected")]
-    [switch]$ConnectToAzureAD
+    [Parameter(Mandatory = $false, HelpMessage = "Connect to Microsoft Graph if not already connected")]
+    [switch]$ConnectToGraph
 )
 
 # Function to write colored output
@@ -129,50 +129,63 @@ function Test-OnPremExists {
     }
 }
 
-# Function to check if a user exists in Entra ID and return ObjectId
+# Function to check if a user exists in Entra ID using Microsoft Graph and return ObjectId
 function Test-EntraUserExists {
     param([string]$UserName)
     
     try {
-        $user = Get-AzureADUser -ObjectId $UserName -ErrorAction Stop
-        return @{
-            Exists = $true
-            ObjectId = $user.ObjectId
-            ObjectType = "User"
+        # Try searching by UserPrincipalName first
+        $user = Get-MgUser -Filter "userPrincipalName eq '$UserName'" -ErrorAction Stop
+        if ($user) {
+            return @{
+                Exists = $true
+                ObjectId = $user.Id
+                ObjectType = "User"
+            }
         }
-    }
-    catch {
-        try {
-            # Try searching by UserPrincipalName
-            $user = Get-AzureADUser -SearchString $UserName -ErrorAction Stop
-            if ($user) { 
+        
+        # Try searching by DisplayName
+        $user = Get-MgUser -Filter "displayName eq '$UserName'" -ErrorAction Stop
+        if ($user) {
+            return @{
+                Exists = $true
+                ObjectId = $user.Id
+                ObjectType = "User"
+            }
+        }
+        
+        # Try searching by Mail
+        $user = Get-MgUser -Filter "mail eq '$UserName'" -ErrorAction Stop
+        if ($user) {
+            return @{
+                Exists = $true
+                ObjectId = $user.Id
+                ObjectType = "User"
+            }
+        }
+        
+        # If UserName looks like an ObjectId, try direct lookup
+        if ($UserName -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+            try {
+                $user = Get-MgUser -UserId $UserName -ErrorAction Stop
                 return @{
                     Exists = $true
-                    ObjectId = $user.ObjectId
+                    ObjectId = $user.Id
                     ObjectType = "User"
                 }
             }
-        }
-        catch {
-            # Try searching by DisplayName
-            try {
-                $user = Get-AzureADUser -All $true | Where-Object { $_.DisplayName -eq $UserName }
-                if ($user) { 
-                    return @{
-                        Exists = $true
-                        ObjectId = $user.ObjectId
-                        ObjectType = "User"
-                    }
-                }
-            }
             catch {
-                return @{
-                    Exists = $false
-                    ObjectId = $null
-                    ObjectType = $null
-                }
+                # ObjectId not found
             }
         }
+        
+        return @{
+            Exists = $false
+            ObjectId = $null
+            ObjectType = $null
+        }
+    }
+    catch {
         return @{
             Exists = $false
             ObjectId = $null
@@ -181,37 +194,53 @@ function Test-EntraUserExists {
     }
 }
 
-# Function to check if a group exists in Entra ID and return ObjectId
+# Function to check if a group exists in Entra ID using Microsoft Graph and return ObjectId
 function Test-EntraGroupExists {
     param([string]$GroupName)
     
     try {
-        $group = Get-AzureADGroup -ObjectId $GroupName -ErrorAction Stop
-        return @{
-            Exists = $true
-            ObjectId = $group.ObjectId
-            ObjectType = "Group"
+        # Try searching by DisplayName
+        $group = Get-MgGroup -Filter "displayName eq '$GroupName'" -ErrorAction Stop
+        if ($group) {
+            return @{
+                Exists = $true
+                ObjectId = $group.Id
+                ObjectType = "Group"
+            }
         }
-    }
-    catch {
-        try {
-            # Try searching by DisplayName
-            $group = Get-AzureADGroup -SearchString $GroupName -ErrorAction Stop
-            if ($group) { 
+        
+        # Try searching by MailNickname (for mail-enabled groups)
+        $group = Get-MgGroup -Filter "mailNickname eq '$GroupName'" -ErrorAction Stop
+        if ($group) {
+            return @{
+                Exists = $true
+                ObjectId = $group.Id
+                ObjectType = "Group"
+            }
+        }
+        
+        # If GroupName looks like an ObjectId, try direct lookup
+        if ($GroupName -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+            try {
+                $group = Get-MgGroup -GroupId $GroupName -ErrorAction Stop
                 return @{
                     Exists = $true
-                    ObjectId = $group.ObjectId
+                    ObjectId = $group.Id
                     ObjectType = "Group"
                 }
             }
-        }
-        catch {
-            return @{
-                Exists = $false
-                ObjectId = $null
-                ObjectType = $null
+            catch {
+                # ObjectId not found
             }
         }
+        
+        return @{
+            Exists = $false
+            ObjectId = $null
+            ObjectType = $null
+        }
+    }
+    catch {
         return @{
             Exists = $false
             ObjectId = $null
@@ -274,37 +303,38 @@ try {
     Import-Module ActiveDirectory -ErrorAction Stop
     Write-ColorOutput "Active Directory module loaded successfully" "Green"
     
-    # Check Azure AD connection
-    Write-ColorOutput "Checking Entra ID connection..." "Yellow"
-    $azureConnected = $false
+    # Check Microsoft Graph connection
+    Write-ColorOutput "Checking Microsoft Graph connection..." "Yellow"
+    $graphConnected = $false
     
     try {
-        $context = Get-AzureADCurrentSessionInfo -ErrorAction Stop
+        $context = Get-MgContext -ErrorAction Stop
         if ($context) {
-            Write-ColorOutput "Already connected to Entra ID" "Green"
-            $azureConnected = $true
+            Write-ColorOutput "Already connected to Microsoft Graph" "Green"
+            $graphConnected = $true
         }
     }
     catch {
-        Write-ColorOutput "Not connected to Entra ID" "Yellow"
+        Write-ColorOutput "Not connected to Microsoft Graph" "Yellow"
     }
     
-    # Connect to Azure AD if needed
-    if (-not $azureConnected) {
-        if ($ConnectToAzureAD) {
-            Write-ColorOutput "Connecting to Entra ID..." "Yellow"
+    # Connect to Microsoft Graph if needed
+    if (-not $graphConnected) {
+        if ($ConnectToGraph) {
+            Write-ColorOutput "Connecting to Microsoft Graph..." "Yellow"
             try {
-                Connect-AzureAD -ErrorAction Stop
-                Write-ColorOutput "Successfully connected to Entra ID" "Green"
-                $azureConnected = $true
+                Connect-MgGraph -ErrorAction Stop
+                Write-ColorOutput "Successfully connected to Microsoft Graph" "Green"
+                $graphConnected = $true
             }
             catch {
-                Write-ColorOutput "Failed to connect to Entra ID. Entra ID checks will be skipped." "Red"
-                $azureConnected = $false
+                Write-ColorOutput "Failed to connect to Microsoft Graph. Entra ID checks will be skipped." "Red"
+                Write-ColorOutput "Error: $($_.Exception.Message)" "Red"
+                $graphConnected = $false
             }
         }
         else {
-            Write-ColorOutput "Not connected to Entra ID. Use -ConnectToAzureAD parameter to connect." "Yellow"
+            Write-ColorOutput "Not connected to Microsoft Graph. Use -ConnectToGraph parameter to connect." "Yellow"
             Write-ColorOutput "Entra ID checks will be skipped." "Yellow"
         }
     }
@@ -355,7 +385,7 @@ try {
         }
         
         # Check Entra ID
-        if ($azureConnected) {
+        if ($graphConnected) {
             try {
                 $entraResult = Test-EntraExists -Name $objectName
                 $result.EntraExists = $entraResult.Exists
@@ -398,7 +428,7 @@ try {
     Write-ColorOutput "Total objects processed: $totalObjects" "White"
     Write-ColorOutput "On-premises AD - Found: $onPremFound, Not Found: $onPremNotFound, Errors: $onPremErrors" "White"
     
-    if ($azureConnected) {
+    if ($graphConnected) {
         $entraFound = ($results | Where-Object { $_.EntraExists -eq $true }).Count
         $entraNotFound = ($results | Where-Object { $_.EntraExists -eq $false }).Count
         $entraErrors = ($results | Where-Object { $_.EntraExists -eq $null }).Count
