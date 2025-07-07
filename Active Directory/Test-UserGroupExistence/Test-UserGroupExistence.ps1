@@ -63,12 +63,30 @@ function Write-ColorOutput {
     Write-Host $Message -ForegroundColor $Color
 }
 
+# Function to get list of domain controllers and prompt user to select one
+function Select-DomainController {
+    $dcs = Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName
+    if (-not $dcs -or $dcs.Count -eq 0) {
+        throw "No domain controllers found. Ensure you are running on a domain-joined computer."
+    }
+    Write-Host "Available Domain Controllers:" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $dcs.Count; $i++) {
+        Write-Host ("[{0}] {1}" -f $i, $dcs[$i])
+    }
+    do {
+        $selection = Read-Host "Select the index of the Domain Controller to use (0-$($dcs.Count-1))"
+    } while (-not ($selection -as [int]) -or $selection -lt 0 -or $selection -ge $dcs.Count)
+    $selectedDC = $dcs[$selection]
+    Write-Host "Selected Domain Controller: $selectedDC" -ForegroundColor Green
+    return $selectedDC
+}
+
 # Function to check if a user exists in on-premises AD and return DistinguishedName
 function Test-OnPremUserExists {
     param([string]$UserName)
     
     try {
-        $user = Get-ADUser -Identity $UserName -Properties DistinguishedName -ErrorAction Stop
+        $user = Get-ADUser -Identity $UserName -Properties DistinguishedName -Server $SelectedDomainController -ErrorAction Stop
         return @{
             Exists = $true
             DistinguishedName = $user.DistinguishedName
@@ -89,7 +107,7 @@ function Test-OnPremGroupExists {
     param([string]$GroupName)
     
     try {
-        $group = Get-ADGroup -Identity $GroupName -Properties DistinguishedName -ErrorAction Stop
+        $group = Get-ADGroup -Identity $GroupName -Properties DistinguishedName -Server $SelectedDomainController -ErrorAction Stop
         return @{
             Exists = $true
             DistinguishedName = $group.DistinguishedName
@@ -302,7 +320,10 @@ try {
     
     Import-Module ActiveDirectory -ErrorAction Stop
     Write-ColorOutput "Active Directory module loaded successfully" "Green"
-    
+
+    # Get and select domain controller
+    $SelectedDomainController = Select-DomainController
+
     # Check Microsoft Graph connection
     Write-ColorOutput "Checking Microsoft Graph connection..." "Yellow"
     $graphConnected = $false
