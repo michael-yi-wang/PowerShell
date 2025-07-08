@@ -1,11 +1,28 @@
-# Import required modules
-Import-Module ActiveDirectory
-Import-Module Microsoft.Graph.Groups
+<#
+.SYNOPSIS
+    Checks if on-premises Active Directory groups exist in Entra ID (Azure AD) by comparing on-prem AD groups to Entra groups using Microsoft Graph.
 
+.DESCRIPTION
+    This script connects to a specified domain controller using PowerShell Remoting over SSL, imports the Active Directory module from that DC, and compares all on-prem AD groups to Entra ID groups by onPremisesSecurityIdentifier. Results are exported to a CSV report.
+
+.PARAMETER DCHostName
+    The FQDN of the domain controller to connect to (must be accessible via WinRM over SSL/port 5986).
+
+.NOTES
+    Author: <Your Name>
+    Date:   <Date>
+    Requires: Microsoft.Graph.Groups module, WinRM over SSL enabled on the DC
+    Example usage:
+        .\Check-ADGroupExistenceInEntra.ps1 -DCHostName dc01.contoso.com
+#>
 param(
     [Parameter(Mandatory = $true)]
     [string]$DCHostName
 )
+
+# Import required modules
+Import-Module ActiveDirectory
+Import-Module Microsoft.Graph.Groups
 
 # Check and install required modules if missing
 # Only check/install Microsoft.Graph.Groups, no need to check ActiveDirectory module locally
@@ -29,7 +46,6 @@ if (-not $connectionTest.TcpTestSucceeded) {
 # Prompt for domain admin credentials and create a PSSession over SSL
 $domainCred = Get-Credential -Message "Enter domain admin credentials for $DCHostName"
 $session = New-PSSession -ComputerName $DCHostName -Credential $domainCred -UseSSL
-
 
 
 # Import AD module from remote session
