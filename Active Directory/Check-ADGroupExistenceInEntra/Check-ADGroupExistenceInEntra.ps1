@@ -1,11 +1,14 @@
-# Check and install required modules if missing
-# ActiveDirectory must be installed via RSAT, not Install-Module
-if (-not (Get-Module -ListAvailable -Name "ActiveDirectory")) {
-    Write-Host "Module 'ActiveDirectory' not found. Please install it via RSAT (Remote Server Administration Tools) or enable it as a Windows feature (Add-WindowsFeature RSAT-AD-PowerShell). Aborting." -ForegroundColor Red
-    exit 1
-}
+# Import required modules
+Import-Module ActiveDirectory
+Import-Module Microsoft.Graph.Groups
 
-# Microsoft.Graph.Groups can be installed from PSGallery
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$DCHostName
+)
+
+# Check and install required modules if missing
+# Only check/install Microsoft.Graph.Groups, no need to check ActiveDirectory module locally
 if (-not (Get-Module -ListAvailable -Name "Microsoft.Graph.Groups")) {
     Write-Host "Module 'Microsoft.Graph.Groups' not found. Installing..." -ForegroundColor Yellow
     try {
@@ -16,42 +19,27 @@ if (-not (Get-Module -ListAvailable -Name "Microsoft.Graph.Groups")) {
     }
 }
 
-# Check if machine is domain-joined
-$computerSystem = Get-WmiObject -Class Win32_ComputerSystem
-if (-not $computerSystem.PartOfDomain) {
-    Write-Host "This script must be run on a domain-joined machine. Aborting." -ForegroundColor Red
+# Check connectivity to the DC on WinRM SSL port (5986)
+$connectionTest = Test-NetConnection -ComputerName $DCHostName -Port 5986
+if (-not $connectionTest.TcpTestSucceeded) {
+    Write-Host "Cannot connect to $DCHostName on port 5986 (WinRM over SSL). Please check connectivity and WinRM configuration." -ForegroundColor Red
     exit 1
 }
 
-# List available domain controllers and prompt user to select one
-$domainControllers = Get-ADDomainController -Filter *
-$dcList = $domainControllers | Select-Object -Property Name, HostName
-Write-Host "Available Domain Controllers:" -ForegroundColor Cyan
-for ($i = 0; $i -lt $dcList.Count; $i++) {
-    Write-Host ("[{0}] {1} ({2})" -f $i, $dcList[$i].Name, $dcList[$i].HostName)
-}
-$selectedIndex = Read-Host "Enter the number of the DC to use"
-if ($selectedIndex -notmatch '^[0-9]+$' -or $selectedIndex -ge $dcList.Count) {
-    Write-Host "Invalid selection. Aborting." -ForegroundColor Red
-    exit 1
-}
-$selectedDC = $dcList[$selectedIndex].HostName
+# Prompt for domain admin credentials and create a PSSession over SSL
+$domainCred = Get-Credential -Message "Enter domain admin credentials for $DCHostName"
+$session = New-PSSession -ComputerName $DCHostName -Credential $domainCred -UseSSL
 
-# Prompt for domain admin credentials and create a PSSession
-$domainCred = Get-Credential -Message "Enter domain admin credentials for $selectedDC"
-$session = New-PSSession -ComputerName $selectedDC -Credential $domainCred
 
-# Import required modules
-Import-Module ActiveDirectory
-Import-Module Microsoft.Graph.Groups
+
+# Import AD module from remote session
+Import-PSSession -Session $session -Module ActiveDirectory -AllowClobber | Out-Null
 
 # Connect to Microsoft Graph (interactive login)
 Connect-MgGraph -Scopes "Group.Read.All"
 
-# Get all groups from on-prem AD via the selected DC
-$adGroups = Invoke-Command -Session $session -ScriptBlock {
-    Get-ADGroup -Filter * -Properties objectSid, mail, GroupCategory, GroupScope, SamAccountName, Name
-}
+# Get all groups from on-prem AD via the imported session (now local)
+$adGroups = Get-ADGroup -Filter * -Properties objectSid, mail, GroupCategory, GroupScope, SamAccountName, Name
 
 # Prepare results array
 $results = @()
