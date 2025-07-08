@@ -1,17 +1,18 @@
 # Check and install required modules if missing
-$requiredModules = @(
-    @{ Name = "ActiveDirectory"; MinimumVersion = "1.0.0.0" },
-    @{ Name = "Microsoft.Graph.Groups"; MinimumVersion = "1.24.0" }
-)
-foreach ($mod in $requiredModules) {
-    if (-not (Get-Module -ListAvailable -Name $mod.Name)) {
-        Write-Host "Module '$($mod.Name)' not found. Installing..." -ForegroundColor Yellow
-        try {
-            Install-Module -Name $($mod.Name) -MinimumVersion $($mod.MinimumVersion) -Force -Scope CurrentUser -AllowClobber
-        } catch {
-            Write-Host "Failed to install module $($mod.Name). Aborting." -ForegroundColor Red
-            exit 1
-        }
+# ActiveDirectory must be installed via RSAT, not Install-Module
+if (-not (Get-Module -ListAvailable -Name "ActiveDirectory")) {
+    Write-Host "Module 'ActiveDirectory' not found. Please install it via RSAT (Remote Server Administration Tools) or enable it as a Windows feature (Add-WindowsFeature RSAT-AD-PowerShell). Aborting." -ForegroundColor Red
+    exit 1
+}
+
+# Microsoft.Graph.Groups can be installed from PSGallery
+if (-not (Get-Module -ListAvailable -Name "Microsoft.Graph.Groups")) {
+    Write-Host "Module 'Microsoft.Graph.Groups' not found. Installing..." -ForegroundColor Yellow
+    try {
+        Install-Module -Name "Microsoft.Graph.Groups" -MinimumVersion "1.24.0" -Force -Scope CurrentUser -AllowClobber
+    } catch {
+        Write-Host "Failed to install module Microsoft.Graph.Groups. Aborting." -ForegroundColor Red
+        exit 1
     }
 }
 
