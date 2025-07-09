@@ -47,29 +47,50 @@ if (-not $connectionTest.TcpTestSucceeded) {
 $domainCred = Get-Credential -Message "Enter domain admin credentials for $DCHostName"
 $session = New-PSSession -ComputerName $DCHostName -Credential $domainCred -UseSSL
 
-
 # Import AD module from remote session
 Import-PSSession -Session $session -Module ActiveDirectory -AllowClobber | Out-Null
 
-# Connect to Microsoft Graph (interactive login)
-Connect-MgGraph -Scopes "Group.Read.All"
+# Get all groups from on-prem AD via the imported session
+Write-Host "Retrieving AD groups from $DCHostName..." -ForegroundColor Green
+$localAdGroups = Get-ADGroup -Filter * -Properties objectSid, mail, GroupCategory, GroupScope, SamAccountName, Name
 
-# Get all groups from on-prem AD via the imported session (now local)
-$adGroups = Get-ADGroup -Filter * -Properties objectSid, mail, GroupCategory, GroupScope, SamAccountName, Name
+# Parse AD groups data to local session (convert to simple objects)
+<#
+Write-Host "Parsing AD groups data..." -ForegroundColor Green
+$localAdGroups = @()
+foreach ($group in $adGroups) {
+    $localAdGroups += [PSCustomObject]@{
+        Name = $group.Name
+        SamAccountName = $group.SamAccountName
+        ObjectSid = $group.objectSid.Value
+        Mail = $group.mail
+        GroupCategory = $group.GroupCategory
+        GroupScope = $group.GroupScope
+    }
+}
+#>
+
+# Clean up the imported session
+Remove-PSSession $session
+
+# Connect to Microsoft Graph locally
+Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Green
+Connect-MgGraph -Scopes "Group.Read.All"
 
 # Prepare results array
 $results = @()
 
-for ($idx = 0; $idx -lt $adGroups.Count; $idx++) {
-    $adGroup = $adGroups[$idx]
-    $percentComplete = [int](($idx / $adGroups.Count) * 100)
-    Write-Progress -Activity "Processing AD Groups" -Status ("Processing {0} of {1}" -f ($idx+1), $adGroups.Count) -PercentComplete $percentComplete
+Write-Host "Comparing AD groups with Entra ID groups..." -ForegroundColor Green
+for ($idx = 0; $idx -lt $localAdGroups.Count; $idx++) {
+    $adGroup = $localAdGroups[$idx]
+    $percentComplete = [int](($idx / $localAdGroups.Count) * 100)
+    Write-Progress -Activity "Processing AD Groups" -Status ("Processing {0} of {1}" -f ($idx+1), $localAdGroups.Count) -PercentComplete $percentComplete
 
-    $onPremSid = $adGroup.objectSid.Value
+    $onPremSid = $adGroup.ObjectSid
     $groupType = if ($adGroup.GroupCategory -eq "Distribution") { "Distribution Group" } else { "Security group" }
-    $groupEmail = $adGroup.mail
+    $groupEmail = $adGroup.Mail
 
-    # Search for group in Entra ID by onPremisesSecurityIdentifier
+    # Search for group in Entra ID by onPremisesSecurityIdentifier (locally)
     $entraGroup = Get-MgGroup -Filter "onPremisesSecurityIdentifier eq '$onPremSid'" -Property DisplayName, Id | Select-Object -First 1
 
     if ($entraGroup) {
