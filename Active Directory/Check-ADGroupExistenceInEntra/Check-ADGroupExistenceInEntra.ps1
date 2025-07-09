@@ -119,6 +119,3 @@ Write-Progress -Activity "Processing AD Groups" -Completed
 $results | Export-Csv -Path ".\AD_Groups_Entra_Report.csv" -NoTypeInformation -Encoding UTF8
 
 Write-Host "Report generated: AD_Groups_Entra_Report.csv" 
-
-# Clean up session
-if ($session) { Remove-PSSession $session } 
