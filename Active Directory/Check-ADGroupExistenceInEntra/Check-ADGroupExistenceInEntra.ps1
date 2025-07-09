@@ -21,7 +21,6 @@ param(
 )
 
 # Import required modules
-Import-Module ActiveDirectory
 Import-Module Microsoft.Graph.Groups
 
 # Check and install required modules if missing
@@ -37,9 +36,9 @@ if (-not (Get-Module -ListAvailable -Name "Microsoft.Graph.Groups")) {
 }
 
 # Check connectivity to the DC on WinRM SSL port (5986)
-$connectionTest = Test-NetConnection -ComputerName $DCHostName -Port 5986
+$connectionTest = Test-NetConnection -ComputerName $DCHostName -Port 5986 | Out-Null
 if (-not $connectionTest.TcpTestSucceeded) {
-    Write-Host "Cannot connect to $DCHostName on port 5986 (WinRM over SSL). Please check connectivity and WinRM configuration." -ForegroundColor Red
+    Write-Host "Cannot connect to $DCHostName on port 5986 (WinRM over SSL). Please check connectivity and WinRM configuration or switch to a different domain controller." -ForegroundColor Red
     exit 1
 }
 
