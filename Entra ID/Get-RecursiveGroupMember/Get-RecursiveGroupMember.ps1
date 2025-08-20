@@ -9,6 +9,7 @@
     This script uses Microsoft Graph PowerShell to retrieve all members of a specified group.
     If the group contains nested groups, it will recursively get all members of those groups as well.
     The script handles both users and groups, and provides detailed output including user properties.
+    Duplicate members are automatically detected and removed to ensure unique results.
 
 .PARAMETER GroupName
     The display name of the group to get members for.
@@ -59,6 +60,7 @@ param(
 
 # Initialize variables
 $script:processedGroups = @{}
+$script:processedMembers = @{}  # Track unique members by ID to prevent duplicates
 $script:allMembers = @()
 $script:groupStack = @()
 
@@ -186,8 +188,14 @@ function Get-RecursiveGroupMembers {
                         ProcessingDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                     }
                     
-                    $script:allMembers += $memberObject
-                    Write-Log "Added user: $($user.DisplayName) ($($user.UserPrincipalName))" "Info"
+                    # Check for duplicates
+                    if (-not $script:processedMembers.ContainsKey($member.Id)) {
+                        $script:allMembers += $memberObject
+                        $script:processedMembers[$member.Id] = $true
+                        Write-Log "Added user: $($user.DisplayName) ($($user.UserPrincipalName))" "Info"
+                    } else {
+                        Write-Log "Skipped duplicate user: $($user.DisplayName) ($($user.UserPrincipalName))" "Info"
+                    }
                 }
                 catch {
                     Write-Log "Failed to get user details for ID '$($member.Id)': $($_.Exception.Message)" "Error"
@@ -214,8 +222,14 @@ function Get-RecursiveGroupMembers {
                             ProcessingDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                         }
                         
-                        $script:allMembers += $groupObject
-                        Write-Log "Added nested group: $($nestedGroup.DisplayName)" "Info"
+                        # Check for duplicates
+                        if (-not $script:processedMembers.ContainsKey($member.Id)) {
+                            $script:allMembers += $groupObject
+                            $script:processedMembers[$member.Id] = $true
+                            Write-Log "Added nested group: $($nestedGroup.DisplayName)" "Info"
+                        } else {
+                            Write-Log "Skipped duplicate nested group: $($nestedGroup.DisplayName)" "Info"
+                        }
                     }
                     
                     # Recursively get members of the nested group
@@ -265,14 +279,14 @@ try {
     Get-RecursiveGroupMembers -GroupId $targetGroup.Id -GroupName $targetGroup.DisplayName
     
     # Display results
-    Write-Log "Processing complete. Found $($script:allMembers.Count) total members." "Success"
+    Write-Log "Processing complete. Found $($script:allMembers.Count) unique members." "Success"
     
     if ($script:allMembers.Count -gt 0) {
         # Display summary
         $userCount = ($script:allMembers | Where-Object { $_.MemberType -eq "User" }).Count
         $groupCount = ($script:allMembers | Where-Object { $_.MemberType -eq "Group" }).Count
         
-        Write-Log "Summary: $userCount users, $groupCount groups" "Info"
+        Write-Log "Summary: $userCount unique users, $groupCount unique groups" "Info"
         
         # Show results
         $script:allMembers | Format-Table -AutoSize
