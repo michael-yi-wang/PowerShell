@@ -74,10 +74,11 @@ function Write-Log {
     $logMessage = "[$timestamp] [$Level] $Message"
     
     switch ($Level) {
-        "Error" { Write-Host $logMessage -ForegroundColor Red }
-        "Warning" { Write-Host $logMessage -ForegroundColor Yellow }
-        "Success" { Write-Host $logMessage -ForegroundColor Green }
-        default { Write-Host $logMessage -ForegroundColor White }
+        "Error"    { Write-Host $logMessage -ForegroundColor Red }
+        "Warning"  { Write-Host $logMessage -ForegroundColor Yellow }
+        "Success"  { Write-Host $logMessage -ForegroundColor Green }
+        "Info"     { Write-Host $logMessage -ForegroundColor Green }
+        default    { Write-Host $logMessage -ForegroundColor Green }
     }
 }
 
@@ -194,7 +195,7 @@ function Get-RecursiveGroupMembers {
                         $script:processedMembers[$member.Id] = $true
                         Write-Log "Added user: $($user.DisplayName) ($($user.UserPrincipalName))" "Info"
                     } else {
-                        Write-Log "Skipped duplicate user: $($user.DisplayName) ($($user.UserPrincipalName))" "Info"
+                        Write-Log "Skipped duplicate user: $($user.DisplayName) ($($user.UserPrincipalName))" "Warning"
                     }
                 }
                 catch {
