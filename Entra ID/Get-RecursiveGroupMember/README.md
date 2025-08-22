@@ -1,3 +1,43 @@
+# Get-RecursiveGroupMember.ps1
+## Overview
+This PowerShell script uses Microsoft Graph PowerShell to retrieve all members of an Azure AD group, including members of any nested groups. It recursively resolves group membership and returns a complete list of all users and groups in the group hierarchy.
+## Prerequisites
+- Microsoft Graph PowerShell module (`Microsoft.Graph`)
+- Permission to read group membership in Azure AD (`Group.Read.All` and `Directory.Read.All` scopes)
+- Azure AD account with sufficient privileges
+## Usage
+```powershell
+Connect-MgGraph -Scopes "Group.Read.All, Directory.Read.All"
+./Get-RecursiveGroupMember.ps1 -GroupName "YourGroupName" [-RemoveDuplicateMembers] [-SaveLog] [-ExportToCsv] [-CsvPath <path>] [-IncludeGroupInfo]
+### Parameters
+- `GroupName` (string, mandatory): The display name of the Azure AD group to query.
+- `RemoveDuplicateMembers` (switch, optional): If specified, removes duplicate members (users and groups) from the output.
+- `SaveLog` (switch, optional): If specified, saves the log output to `.\log\[yyyy-MM-dd HH-mm-ss].log`.
+- `ExportToCsv` (switch, optional): If specified, exports results to a CSV file.
+- `CsvPath` (string, optional): Path to save the CSV file.
+- `IncludeGroupInfo` (switch, optional): If specified, includes nested group info in the output.
+## How It Works
+1. Connects to Microsoft Graph if not already connected.
+2. Finds the group by display name or ID.
+3. Recursively retrieves all members, including those in nested groups.
+4. Optionally removes duplicate members if `-RemoveDuplicateMembers` is used.
+5. Optionally saves logs to a timestamped file in the `log` folder if `-SaveLog` is used.
+6. Outputs the full member list and optionally exports to CSV.
+## Example
+```powershell
+./Get-RecursiveGroupMember.ps1 -GroupName "Finance Team" -RemoveDuplicateMembers -SaveLog -ExportToCsv
+## Output
+- The script returns an array of member objects, including users and groups.
+- If `-ExportToCsv` is used, results are saved to a CSV file.
+- If `-SaveLog` is used, logs are saved to `.\log\[yyyy-MM-dd HH-mm-ss].log`.
+## Notes
+- If the group name is not found, the script will exit with an error.
+- Nested groups are resolved recursively to ensure all members are included.
+- Duplicate removal applies to both users and groups when `-RemoveDuplicateMembers` is specified.
+## Author
+GitHub Copilot
+## License
+MIT
 # Get-RecursiveGroupMember
 
 A PowerShell script that uses Microsoft Graph PowerShell to recursively retrieve all members of a group, including nested groups.
