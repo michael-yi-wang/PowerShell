@@ -44,18 +44,24 @@
 param(
     [Parameter(ParameterSetName = 'ByName', Mandatory = $true, Position = 0)]
     [string]$GroupName,
-    
+
     [Parameter(ParameterSetName = 'ById', Mandatory = $true)]
     [string]$GroupId,
-    
+
     [Parameter()]
     [switch]$ExportToCsv,
-    
+
     [Parameter()]
     [string]$CsvPath,
-    
+
     [Parameter()]
-    [switch]$IncludeGroupInfo
+    [switch]$IncludeGroupInfo,
+
+    [Parameter()]
+    [switch]$RemoveDuplicateMembers,
+
+    [Parameter()]
+    [switch]$SaveLog
 )
 
 # Initialize variables
@@ -69,10 +75,21 @@ function Write-Log {
         [string]$Message,
         [string]$Level = "Info"
     )
-    
+
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logMessage = "[$timestamp] [$Level] $Message"
-    
+
+    # Save log to file if requested
+    if ($SaveLog) {
+        if (-not $script:LogFilePath) {
+            $logDir = Join-Path $PSScriptRoot 'log'
+            if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory | Out-Null }
+            $logFileName = "$(Get-Date -Format 'yyyy-MM-dd HH-mm-ss').log"
+            $script:LogFilePath = Join-Path $logDir $logFileName
+        }
+        Add-Content -Path $script:LogFilePath -Value $logMessage
+    }
+
     switch ($Level) {
         "Error"    { Write-Host $logMessage -ForegroundColor Red }
         "Warning"  { Write-Host $logMessage -ForegroundColor Yellow }
@@ -190,12 +207,17 @@ function Get-RecursiveGroupMembers {
                     }
                     
                     # Check for duplicates
-                    if (-not $script:processedMembers.ContainsKey($member.Id)) {
-                        $script:allMembers += $memberObject
-                        $script:processedMembers[$member.Id] = $true
-                        Write-Log "Added user: $($user.DisplayName) ($($user.UserPrincipalName))" "Info"
+                    if ($RemoveDuplicateMembers) {
+                        if (-not $script:processedMembers.ContainsKey($member.Id)) {
+                            $script:allMembers += $memberObject
+                            $script:processedMembers[$member.Id] = $true
+                            Write-Log "Added user: $($user.DisplayName) ($($user.UserPrincipalName))" "Info"
+                        } else {
+                            Write-Log "Skipped duplicate user: $($user.DisplayName) ($($user.UserPrincipalName))" "Warning"
+                        }
                     } else {
-                        Write-Log "Skipped duplicate user: $($user.DisplayName) ($($user.UserPrincipalName))" "Warning"
+                        $script:allMembers += $memberObject
+                        Write-Log "Added user: $($user.DisplayName) ($($user.UserPrincipalName))" "Info"
                     }
                 }
                 catch {
@@ -224,12 +246,17 @@ function Get-RecursiveGroupMembers {
                         }
                         
                         # Check for duplicates
-                        if (-not $script:processedMembers.ContainsKey($member.Id)) {
-                            $script:allMembers += $groupObject
-                            $script:processedMembers[$member.Id] = $true
-                            Write-Log "Added nested group: $($nestedGroup.DisplayName)" "Info"
+                        if ($RemoveDuplicateMembers) {
+                            if (-not $script:processedMembers.ContainsKey($member.Id)) {
+                                $script:allMembers += $groupObject
+                                $script:processedMembers[$member.Id] = $true
+                                Write-Log "Added nested group: $($nestedGroup.DisplayName)" "Info"
+                            } else {
+                                Write-Log "Skipped duplicate nested group: $($nestedGroup.DisplayName)" "Info"
+                            }
                         } else {
-                            Write-Log "Skipped duplicate nested group: $($nestedGroup.DisplayName)" "Info"
+                            $script:allMembers += $groupObject
+                            Write-Log "Added nested group: $($nestedGroup.DisplayName)" "Info"
                         }
                     }
                     
