@@ -1,11 +1,17 @@
 # Get-RecursiveGroupMember.ps1
+
 ## Overview
+
 This PowerShell script uses Microsoft Graph PowerShell to retrieve all members of an Azure AD group, including members of any nested groups. It recursively resolves group membership and returns a complete list of all users and groups in the group hierarchy.
+
 ## Prerequisites
+
 - Microsoft Graph PowerShell module (`Microsoft.Graph`)
 - Permission to read group membership in Azure AD (`Group.Read.All` and `Directory.Read.All` scopes)
 - Azure AD account with sufficient privileges
+
 ## Usage
+
 ```powershell
 Connect-MgGraph -Scopes "Group.Read.All, Directory.Read.All"
 ./Get-RecursiveGroupMember.ps1 -GroupName "YourGroupName" [-RemoveDuplicateMembers] [-SaveLog] [-ExportToCsv] [-CsvPath <path>] [-IncludeGroupInfo]
@@ -55,6 +61,7 @@ A PowerShell script that uses Microsoft Graph PowerShell to recursively retrieve
 ## Prerequisites
 
 1. **Microsoft Graph PowerShell Module**: Install the required module
+
    ```powershell
    Install-Module Microsoft.Graph -Force
    ```
@@ -71,16 +78,18 @@ A PowerShell script that uses Microsoft Graph PowerShell to recursively retrieve
 2. Place it in your desired directory
 3. Ensure you have the Microsoft Graph PowerShell module installed
 
-## Usage
+## Example
 
 ### Basic Usage
 
 Get all members of a group by name:
+
 ```powershell
 .\Get-RecursiveGroupMember.ps1 -GroupName "IT Department"
 ```
 
 Get all members of a group by Object ID:
+
 ```powershell
 .\Get-RecursiveGroupMember.ps1 -GroupId "12345678-1234-1234-1234-123456789012"
 ```
@@ -88,11 +97,13 @@ Get all members of a group by Object ID:
 ### Advanced Usage
 
 Export results to CSV with custom path:
+
 ```powershell
 .\Get-RecursiveGroupMember.ps1 -GroupName "Security Groups" -ExportToCsv -CsvPath "C:\Temp\GroupMembers.csv"
 ```
 
 Include nested group information in the output:
+
 ```powershell
 .\Get-RecursiveGroupMember.ps1 -GroupName "Department Groups" -IncludeGroupInfo -ExportToCsv
 ```
@@ -129,12 +140,14 @@ The script provides detailed information for each member:
 ## Examples
 
 ### Example 1: Basic Group Member Retrieval
+
 ```powershell
 .\Get-RecursiveGroupMember.ps1 -GroupName "Marketing Team"
 ```
 
 Output:
-```
+
+```powershell
 [2024-01-15 10:30:00] [Info] Starting recursive group member retrieval
 [2024-01-15 10:30:00] [Success] Successfully connected to Microsoft Graph
 [2024-01-15 10:30:00] [Success] Found target group: Marketing Team (ID: 12345678-1234-1234-1234-123456789012)
@@ -147,6 +160,7 @@ Output:
 ```
 
 ### Example 2: Export to CSV
+
 ```powershell
 .\Get-RecursiveGroupMember.ps1 -GroupName "IT Department" -ExportToCsv
 ```
@@ -186,6 +200,7 @@ The script includes comprehensive error handling:
 ### Debug Mode
 
 To get more detailed output, run the script with verbose logging:
+
 ```powershell
 .\Get-RecursiveGroupMember.ps1 -GroupName "Your Group" -Verbose
 ```
