@@ -49,9 +49,6 @@ param(
     [string]$GroupId,
 
     [Parameter()]
-    [switch]$ExportToCsv,
-
-    [Parameter()]
     [string]$CsvPath,
 
     [Parameter()]
@@ -319,13 +316,8 @@ try {
         # Show results
         $script:allMembers | Format-Table -AutoSize
         
-        # Export to CSV if requested
-        if ($ExportToCsv) {
-            if (-not $CsvPath) {
-                $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-                $CsvPath = ".\GroupMembers_$($targetGroup.DisplayName)_$timestamp.csv"
-            }
-            
+        # Export to CSV if path is provided
+        if ($CsvPath) {
             try {
                 $script:allMembers | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
                 Write-Log "Results exported to: $CsvPath" "Success"
