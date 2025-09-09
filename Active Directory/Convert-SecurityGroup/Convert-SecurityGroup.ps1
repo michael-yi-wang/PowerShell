@@ -107,7 +107,9 @@ if (-not (Test-Path -Path $CsvPath)) {
 
 $CsvFull = (Resolve-Path -Path $CsvPath).ProviderPath
 $CsvFolder = Split-Path -Parent $CsvFull
+
 $LogPath = Join-Path $CsvFolder ("Convert-SecurityGroup_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+$Global:LogPath = $LogPath
 
 Write-Log "Script started. CSV: $CsvFull. Target scope: $TargetGroupScope"
 
@@ -149,7 +151,7 @@ foreach ($row in $csv) {
     }
 
     try {
-        $g = Get-ADGroup -Identity $identity -Properties GroupScope,GroupCategory,DistinguishedName,Name,sAMAccountName -ErrorAction Stop
+        $g = Get-ADGroup -Identity $identity -Properties GroupScope,GroupCategory,DistinguishedName,Name,sAMAccountName,Members -ErrorAction Stop
     } catch {
         Write-Log "Group not found: $identity" "ERROR"
         $workItems += [PSCustomObject]@{
@@ -177,15 +179,38 @@ foreach ($row in $csv) {
         Write-Log "Failed to enumerate parent groups for $($g.Name): $_" "WARN"
     }
 
-    $needsChange = ($g.GroupScope -ne $TargetGroupScope)
+    # Detect member conflicts for Global conversion
+    $memberConflicts = @()
+    if ($TargetGroupScope -eq 'Global') {
+        try {
+            $members = Get-ADGroupMember -Identity $g.DistinguishedName -ErrorAction SilentlyContinue
+            foreach ($m in $members) {
+                if ($m.objectClass -eq 'group') {
+                    $mGroup = Get-ADGroup -Identity $m.DistinguishedName -Properties GroupScope -ErrorAction SilentlyContinue
+                    if ($mGroup -and $mGroup.GroupScope -eq 'Universal') {
+                        $memberConflicts += [PSCustomObject]@{
+                            Name = $mGroup.Name
+                            SamAccountName = $mGroup.sAMAccountName
+                            DistinguishedName = $mGroup.DistinguishedName
+                            GroupScope = $mGroup.GroupScope
+                        }
+                    }
+                }
+            }
+        } catch {}
+    }
 
-    # Detect potential parent-scope conflicts: parent scope is Global while target is Universal
+    # Detect parent conflicts for Universal conversion
     $parentConflicts = @()
-    foreach ($pg in $parents) {
-        if (($pg.GroupScope -eq 'Global') -and ($TargetGroupScope -eq 'Universal')) {
-            $parentConflicts += $pg
+    if ($TargetGroupScope -eq 'Universal') {
+        foreach ($pg in $parents) {
+            if ($pg.GroupScope -eq 'Global' -or $pg.GroupScope -eq 'DomainLocal') {
+                $parentConflicts += $pg
+            }
         }
     }
+
+    $needsChange = ($g.GroupScope -ne $TargetGroupScope)
 
     $workItems += [PSCustomObject]@{
         InputIdentity = $identity
@@ -198,104 +223,102 @@ foreach ($row in $csv) {
         NeedsChange = $needsChange
         ParentGroups = $parents
         ParentConflicts = $parentConflicts
+        MemberConflicts = $memberConflicts
     }
 }
 
 # Present gathered info and pending changes
-Write-Host "\n Summary of groups and pending actions:`n" -ForegroundColor Cyan
+Write-Host "`nSummary of groups and pending actions:`n" -ForegroundColor Cyan
 
 $toChange = $workItems | Where-Object { $_.Found -and $_.NeedsChange }
 $skipped = $workItems | Where-Object { -not $_.Found -or -not $_.NeedsChange }
 
-Write-Host "Groups found: $($workItems | Where-Object { $_.Found } | Measure-Object).Count"
 Write-Host "Groups to change: $($toChange.Count)"
-Write-Host "Groups skipped or not found: $($skipped.Count)\n"
+Write-Host "Groups skipped or not found: $($skipped.Count)`n"
 
+# Display groups not found
+$notFound = $workItems | Where-Object { -not $_.Found }
+if ($notFound.Count -gt 0) {
+    Write-Host "Groups not found:" -ForegroundColor Red
+    foreach ($nf in $notFound) {
+        Write-Host "- $($nf.InputIdentity)"
+    }
+    Write-Host ""
+}
 if ($toChange.Count -gt 0) {
     Write-Host "Pending conversions:" -ForegroundColor Yellow
     $toChange | ForEach-Object {
-        $conflictText = if ($_.ParentConflicts.Count -gt 0) { "CONFLICT: Parent(s) with Global scope: $(( $_.ParentConflicts | ForEach-Object { $_.Name } ) -join ', ')" } else { '' }
+        $conflictText = ""
+        if ($_.ParentConflicts.Count -gt 0) {
+            $conflictText += "PARENT CONFLICT: " + ($_.ParentConflicts | ForEach-Object { $_.Name } -join ', ')
+        }
+        if ($_.MemberConflicts.Count -gt 0) {
+            if ($conflictText) { $conflictText += "; " }
+            $conflictText += "MEMBER CONFLICT: " + ($_.MemberConflicts | ForEach-Object { $_.Name } -join ', ')
+        }
         Write-Host ("- {0}  (current: {1} -> target: {2}) {3}" -f $_.Name, $_.CurrentScope, $_.TargetScope, $conflictText)
     }
     Write-Host "`nLog file: $LogPath`n"
 
-    # Ask how to proceed when conflicts exist. Require resolving parent-group scope conflicts before converting members.
-    $hasConflicts = ($toChange | Where-Object { $_.ParentConflicts.Count -gt 0 }).Count -gt 0
-
-    if ($hasConflicts) {
-        Write-Host "One or more groups have parent-scope conflicts (Global parent cannot contain Universal member)." -ForegroundColor Red
-
-        # Collect unique conflicting parent groups
-        $allConflictingParents = @()
-        foreach ($item in $toChange) {
-            foreach ($p in $item.ParentConflicts) {
-                if (-not ($allConflictingParents | Where-Object { $_.DistinguishedName -eq $p.DistinguishedName })) {
-                    $allConflictingParents += $p
-                }
+    # Collect all unique conflicting groups (parents or members)
+    $conflictingGroups = @()
+    foreach ($item in $toChange) {
+        foreach ($p in $item.ParentConflicts) {
+            if (-not ($conflictingGroups | Where-Object { $_.DistinguishedName -eq $p.DistinguishedName })) {
+                $conflictingGroups += $p
             }
         }
+        foreach ($m in $item.MemberConflicts) {
+            if (-not ($conflictingGroups | Where-Object { $_.DistinguishedName -eq $m.DistinguishedName })) {
+                $conflictingGroups += $m
+            }
+        }
+    }
 
-        Write-Host "The following parent groups conflict and must be converted first if you want to proceed:`n" -ForegroundColor Yellow
-        $allConflictingParents | ForEach-Object { Write-Host ("- {0} ({1}) current scope: {2}" -f $_.Name, $_.SamAccountName, $_.GroupScope) }
+    if ($conflictingGroups.Count -gt 0) {
+        Write-Host "The following conflicting groups must be converted to $TargetGroupScope first if you want to proceed:`n" -ForegroundColor Yellow
+        $conflictingGroups | ForEach-Object { Write-Host ("- {0} ({1}) current scope: {2}" -f $_.Name, $_.SamAccountName, $_.GroupScope) }
         Write-Host ""
-
-        $r = Read-Host "Convert the listed parent group(s) to $TargetGroupScope first? (Y/N)"
+        $r = Read-Host "Convert the listed conflicting group(s) to $TargetGroupScope first? (Y/N)"
         if ($r.ToUpper() -ne 'Y') {
-            Write-Log 'User chose not to convert parent groups; aborting due to conflicts'
-            return
-        }
-
-        # Attempt conversions of parent groups
-        $parentErrors = @()
-        foreach ($p in $allConflictingParents) {
-            Write-Log "Attempting to convert parent group $($p.Name) -> $TargetGroupScope"
-            try {
-                if ($WhatIf) {
-                    Set-ADGroup -Identity $p.DistinguishedName -GroupScope $TargetGroupScope -WhatIf
-                    Write-Log "(WhatIf) Would set parent $($p.Name) -> $TargetGroupScope"
-                } else {
-                    Set-ADGroup -Identity $p.DistinguishedName -GroupScope $TargetGroupScope -ErrorAction Stop
-                    Write-Log "SUCCESS: Converted parent $($p.Name) -> $TargetGroupScope"
-                }
-            } catch {
-                Write-Log "ERROR converting parent $($p.Name): $_" "ERROR"
-                $parentErrors += $p
-            }
-        }
-
-        if ($parentErrors.Count -gt 0) {
-            Write-Log "One or more parent conversions failed; aborting conversion of target groups" "ERROR"
-            return
-        }
-
-        # Re-validate no remaining conflicts by checking actual parent group scopes
-        $stillConflict = @()
-        foreach ($item in $toChange) {
-            foreach ($p in $item.ParentGroups) {
+            Write-Log 'User chose not to convert conflicting groups; skipping affected groups.'
+            # Remove any toChange items with conflicts from conversion
+            $toChange = $toChange | Where-Object { ($_.ParentConflicts.Count -eq 0) -and ($_.MemberConflicts.Count -eq 0) }
+        } else {
+            # Attempt conversions of conflicting groups
+            $conflictErrors = @()
+            foreach ($cg in $conflictingGroups) {
+                Write-Log "Attempting to convert conflicting group $($cg.Name) -> $TargetGroupScope"
                 try {
-                    $pFull = Get-ADGroup -Identity $p.DistinguishedName -Properties GroupScope -ErrorAction Stop
-                    if (($pFull.GroupScope -eq 'Global') -and ($TargetGroupScope -eq 'Universal')) {
-                        $stillConflict += $pFull
+                    if ($WhatIf) {
+                        Set-ADGroup -Identity $cg.DistinguishedName -GroupScope $TargetGroupScope -WhatIf
+                        Write-Log "(WhatIf) Would set conflicting $($cg.Name) -> $TargetGroupScope"
+                    } else {
+                        Set-ADGroup -Identity $cg.DistinguishedName -GroupScope $TargetGroupScope -ErrorAction Stop
+                        Write-Log "SUCCESS: Converted conflicting $($cg.Name) -> $TargetGroupScope"
                     }
                 } catch {
-                    # ignore lookup errors for now
+                    Write-Log "ERROR converting conflicting $($cg.Name): $_" "ERROR"
+                    $conflictErrors += $cg
                 }
             }
-        }
-
-        if ($stillConflict.Count -gt 0) {
-            Write-Log "Conflicts remain after attempting to convert parent groups; aborting" "ERROR"
-            return
-        } else {
-            # Clear ParentConflicts so conversion of members can proceed
-            foreach ($wi in $workItems) { $wi.ParentConflicts = @() }
-            Write-Log "Parent conflicts resolved."
-            $confirmAfterParents = Read-Host "Parent groups were converted. Proceed with converting member groups now? (Y/N)"
-            if ($confirmAfterParents.ToUpper() -ne 'Y') {
-                Write-Log 'User aborted after parent conversion';
-                return
+            if ($conflictErrors.Count -gt 0) {
+                Write-Log "One or more conflicting group conversions failed; skipping affected groups." "ERROR"
+                $toChange = $toChange | Where-Object { ($_.ParentConflicts.Count -eq 0) -and ($_.MemberConflicts.Count -eq 0) }
+            } else {
+                # Clear ParentConflicts and MemberConflicts for found items with the property
+                foreach ($wi in $workItems) {
+                    if ($wi.Found -and ($wi.PSObject.Properties["ParentConflicts"])) { $wi.ParentConflicts = @() }
+                    if ($wi.Found -and ($wi.PSObject.Properties["MemberConflicts"])) { $wi.MemberConflicts = @() }
+                }
+                Write-Log "Conflicting groups resolved."
+                $confirmAfterConflicts = Read-Host "Conflicting groups were converted. Proceed with converting member groups now? (Y/N)"
+                if ($confirmAfterConflicts.ToUpper() -ne 'Y') {
+                    Write-Log 'User aborted after conflict conversion';
+                    return
+                }
+                Write-Log "User confirmed to proceed with member group conversions"
             }
-            Write-Log "User confirmed to proceed with member group conversions"
         }
     } else {
         # simple yes/no confirmation when no conflicts
@@ -303,7 +326,7 @@ if ($toChange.Count -gt 0) {
         if ($yn.ToUpper() -ne 'Y') { Write-Log 'User aborted before conversion'; return }
     }
 
-    # Build final list: proceed with all items (parent conflicts are resolved)
+    # Build final list: proceed with all items (conflicts resolved or skipped)
     $finalList = $toChange | ForEach-Object { [PSCustomObject]@{ Item = $_; Proceed = $true } }
 
     # Execute conversions
