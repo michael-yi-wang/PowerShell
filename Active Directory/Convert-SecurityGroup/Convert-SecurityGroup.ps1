@@ -37,7 +37,8 @@ param(
 
     [switch]$WhatIf,
 
-    [Parameter(Mandatory = $false)]
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
     [string]$DomainController
 )
 
@@ -59,8 +60,9 @@ function Write-Log {
     Write-Host $line
 }
 
-# Remote vs local AD execution
-$UseRemote = $false
+# Clear any existing PSSessions to avoid conflicts
+Get-PSSession | Remove-PSSession -ErrorAction SilentlyContinue
+
 $ADSession = $null
 if ($PSBoundParameters.ContainsKey('DomainController') -and -not [string]::IsNullOrWhiteSpace($DomainController)) {
     try {
@@ -78,10 +80,10 @@ if ($PSBoundParameters.ContainsKey('DomainController') -and -not [string]::IsNul
             return
         }
 
-        $ADSession = New-PSSession -ComputerName $DomainController -Credential $cred -ErrorAction Stop
+        $ADSession = New-PSSession -ComputerName $DomainController -Credential $cred -UseSSL -ErrorAction Stop
         # Import module on remote side (ensures AD cmdlets available)
-        Invoke-Command -Session $ADSession -ScriptBlock { Import-Module ActiveDirectory -ErrorAction Stop } -ErrorAction Stop
-        $UseRemote = $true
+        #Invoke-Command -Session $ADSession -ScriptBlock { Import-Module ActiveDirectory -ErrorAction Stop } -ErrorAction Stop
+        Import-PSSession $ADSession -Module ActiveDirectory -AllowClobber | Out-Null
     } catch {
         $errMsg = ("Failed to create remote session to {0}: {1}" -f $DomainController, $_)
         Write-Log -Message $errMsg -Level 'ERROR'
@@ -96,69 +98,7 @@ if ($PSBoundParameters.ContainsKey('DomainController') -and -not [string]::IsNul
     }
 }
 
-# Helper wrappers for AD operations (use remote session when requested)
-function Get-ADGroupEx {
-    param(
-        [Parameter(Mandatory=$true)] $Identity,
-        [Parameter(Mandatory=$false)] $Properties = @()
-    )
-    if ($UseRemote) {
-        return Invoke-Command -Session $ADSession -ScriptBlock {
-            param($id,$props)
-            Import-Module ActiveDirectory -ErrorAction Stop
-            if ($props -and $props.Length -gt 0) {
-                Get-ADGroup -Identity $id -Properties $props -ErrorAction Stop
-            } else {
-                Get-ADGroup -Identity $id -ErrorAction Stop
-            }
-        } -ArgumentList $Identity,$Properties -ErrorAction Stop
-    } else {
-        if ($Properties -and $Properties.Length -gt 0) {
-            return Get-ADGroup -Identity $Identity -Properties $Properties -ErrorAction Stop
-        } else {
-            return Get-ADGroup -Identity $Identity -ErrorAction Stop
-        }
-    }
-}
-
-function Get-ADPrincipalGroupMembershipEx {
-    param([Parameter(Mandatory=$true)] $Identity)
-    if ($UseRemote) {
-        return Invoke-Command -Session $ADSession -ScriptBlock {
-            param($id)
-            Import-Module ActiveDirectory -ErrorAction Stop
-            Get-ADPrincipalGroupMembership -Identity $id -ErrorAction Stop
-        } -ArgumentList $Identity -ErrorAction Stop
-    } else {
-        return Get-ADPrincipalGroupMembership -Identity $Identity -ErrorAction Stop
-    }
-}
-
-function Set-ADGroupEx {
-    param(
-        [Parameter(Mandatory=$true)] $Identity,
-        [Parameter(Mandatory=$true)] $GroupScope,
-        [switch]$WhatIfLocal
-    )
-    if ($UseRemote) {
-        $sb = {
-            param($id,$scope,$whatif)
-            Import-Module ActiveDirectory -ErrorAction Stop
-            if ($whatif) {
-                Set-ADGroup -Identity $id -GroupScope $scope -WhatIf
-            } else {
-                Set-ADGroup -Identity $id -GroupScope $scope -ErrorAction Stop
-            }
-        }
-        return Invoke-Command -Session $ADSession -ScriptBlock $sb -ArgumentList $Identity,$GroupScope,($WhatIfLocal.IsPresent) -ErrorAction Stop
-    } else {
-        if ($WhatIfLocal) {
-            Set-ADGroup -Identity $Identity -GroupScope $GroupScope -WhatIf
-        } else {
-            Set-ADGroup -Identity $Identity -GroupScope $GroupScope -ErrorAction Stop
-        }
-    }
-}
+# Note: remote-wrapper helper functions were removed to use direct AD cmdlets in this script.
 
 if (-not (Test-Path -Path $CsvPath)) {
     Write-Error "CSV file not found: $CsvPath"
@@ -262,7 +202,7 @@ foreach ($row in $csv) {
 }
 
 # Present gathered info and pending changes
-Write-Host "\nSummary of groups and pending actions:`n" -ForegroundColor Cyan
+Write-Host "\n Summary of groups and pending actions:`n" -ForegroundColor Cyan
 
 $toChange = $workItems | Where-Object { $_.Found -and $_.NeedsChange }
 $skipped = $workItems | Where-Object { -not $_.Found -or -not $_.NeedsChange }
@@ -274,47 +214,97 @@ Write-Host "Groups skipped or not found: $($skipped.Count)\n"
 if ($toChange.Count -gt 0) {
     Write-Host "Pending conversions:" -ForegroundColor Yellow
     $toChange | ForEach-Object {
-        $conflictText = if ($_.ParentConflicts.Count -gt 0) { "CONFLICT: Parent(s) with Global scope: $($_.ParentConflicts | ForEach-Object { $_.Name } -join ', ')" } else { '' }
+        $conflictText = if ($_.ParentConflicts.Count -gt 0) { "CONFLICT: Parent(s) with Global scope: $(( $_.ParentConflicts | ForEach-Object { $_.Name } ) -join ', ')" } else { '' }
         Write-Host ("- {0}  (current: {1} -> target: {2}) {3}" -f $_.Name, $_.CurrentScope, $_.TargetScope, $conflictText)
     }
     Write-Host "`nLog file: $LogPath`n"
 
-    # Ask how to proceed when conflicts exist
+    # Ask how to proceed when conflicts exist. Require resolving parent-group scope conflicts before converting members.
     $hasConflicts = ($toChange | Where-Object { $_.ParentConflicts.Count -gt 0 }).Count -gt 0
 
-    $globalChoice = $null
     if ($hasConflicts) {
         Write-Host "One or more groups have parent-scope conflicts (Global parent cannot contain Universal member)." -ForegroundColor Red
-        Write-Host "Choose how to proceed:`n  [A]bort - cancel everything`n  [P]rompt - prompt per conflicting group`n  [C]ontinue - attempt all conversions regardless of conflicts`n"
-        while ($true) {
-            $globalChoice = Read-Host "Enter choice (A/P/C)"
-            switch ($globalChoice.ToUpper()) {
-                'A' { Write-Log 'User aborted due to parent-scope conflicts'; return }
-                'P' { break }
-                'C' { break }
-                default { Write-Host 'Invalid choice, enter A, P, or C' }
+
+        # Collect unique conflicting parent groups
+        $allConflictingParents = @()
+        foreach ($item in $toChange) {
+            foreach ($p in $item.ParentConflicts) {
+                if (-not ($allConflictingParents | Where-Object { $_.DistinguishedName -eq $p.DistinguishedName })) {
+                    $allConflictingParents += $p
+                }
             }
         }
+
+        Write-Host "The following parent groups conflict and must be converted first if you want to proceed:`n" -ForegroundColor Yellow
+        $allConflictingParents | ForEach-Object { Write-Host ("- {0} ({1}) current scope: {2}" -f $_.Name, $_.SamAccountName, $_.GroupScope) }
+        Write-Host ""
+
+        $r = Read-Host "Convert the listed parent group(s) to $TargetGroupScope first? (Y/N)"
+        if ($r.ToUpper() -ne 'Y') {
+            Write-Log 'User chose not to convert parent groups; aborting due to conflicts'
+            return
+        }
+
+        # Attempt conversions of parent groups
+        $parentErrors = @()
+        foreach ($p in $allConflictingParents) {
+            Write-Log "Attempting to convert parent group $($p.Name) -> $TargetGroupScope"
+            try {
+                if ($WhatIf) {
+                    Set-ADGroup -Identity $p.DistinguishedName -GroupScope $TargetGroupScope -WhatIf
+                    Write-Log "(WhatIf) Would set parent $($p.Name) -> $TargetGroupScope"
+                } else {
+                    Set-ADGroup -Identity $p.DistinguishedName -GroupScope $TargetGroupScope -ErrorAction Stop
+                    Write-Log "SUCCESS: Converted parent $($p.Name) -> $TargetGroupScope"
+                }
+            } catch {
+                Write-Log "ERROR converting parent $($p.Name): $_" "ERROR"
+                $parentErrors += $p
+            }
+        }
+
+        if ($parentErrors.Count -gt 0) {
+            Write-Log "One or more parent conversions failed; aborting conversion of target groups" "ERROR"
+            return
+        }
+
+        # Re-validate no remaining conflicts by checking actual parent group scopes
+        $stillConflict = @()
+        foreach ($item in $toChange) {
+            foreach ($p in $item.ParentGroups) {
+                try {
+                    $pFull = Get-ADGroup -Identity $p.DistinguishedName -Properties GroupScope -ErrorAction Stop
+                    if (($pFull.GroupScope -eq 'Global') -and ($TargetGroupScope -eq 'Universal')) {
+                        $stillConflict += $pFull
+                    }
+                } catch {
+                    # ignore lookup errors for now
+                }
+            }
+        }
+
+        if ($stillConflict.Count -gt 0) {
+            Write-Log "Conflicts remain after attempting to convert parent groups; aborting" "ERROR"
+            return
+        } else {
+            # Clear ParentConflicts so conversion of members can proceed
+            foreach ($wi in $workItems) { $wi.ParentConflicts = @() }
+            Write-Log "Parent conflicts resolved."
+            $confirmAfterParents = Read-Host "Parent groups were converted. Proceed with converting member groups now? (Y/N)"
+            if ($confirmAfterParents.ToUpper() -ne 'Y') {
+                Write-Log 'User aborted after parent conversion';
+                return
+            }
+            Write-Log "User confirmed to proceed with member group conversions"
+        }
     } else {
-        # simple yes/no confirmation
+        # simple yes/no confirmation when no conflicts
         $yn = Read-Host "Proceed with all listed conversions? (Y/N)"
         if ($yn.ToUpper() -ne 'Y') { Write-Log 'User aborted before conversion'; return }
     }
 
-    # Final per-item decisions if prompting
-    $finalList = @()
-    foreach ($item in $toChange) {
-        $proceed = $true
-        if ($globalChoice -eq 'P' -and $item.ParentConflicts.Count -gt 0) {
-            Write-Host "Group: $($item.Name) has parent(s) with Global scope: $($item.ParentConflicts | ForEach-Object { $_.Name } -join ', ')" -ForegroundColor Magenta
-            $r = Read-Host "Convert $($item.Name) to $($item.TargetScope) anyway? (Y/N)"
-            if ($r.ToUpper() -ne 'Y') { $proceed = $false; Write-Log "User chose to skip conversion for $($item.Name) due to conflict" }
-        }
-        $finalList += [PSCustomObject]@{
-            Item = $item
-            Proceed = $proceed
-        }
-    }
+    # Build final list: proceed with all items (parent conflicts are resolved)
+    $finalList = $toChange | ForEach-Object { [PSCustomObject]@{ Item = $_; Proceed = $true } }
 
     # Execute conversions
     foreach ($entry in $finalList) {
@@ -343,7 +333,7 @@ if ($toChange.Count -gt 0) {
 
 Write-Log "Script finished."
 
-if ($UseRemote -and $ADSession) {
+if ($ADSession) {
     try {
         Remove-PSSession -Session $ADSession -ErrorAction Stop
         Write-Log ("Closed remote session to {0}" -f $DomainController)
