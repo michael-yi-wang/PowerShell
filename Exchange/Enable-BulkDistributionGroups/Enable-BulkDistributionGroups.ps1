@@ -12,13 +12,17 @@
     Must be run on an on-prem Exchange server with the Exchange Management Shell.
 #>
 
+
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [string]$CsvFile,
 
     [Parameter()]
-    [bool]$HiddenFromGAL = $false
+    [bool]$HiddenFromGAL = $false,
+
+    [Parameter()]
+    [bool]$AllowExternal = $false
 )
 
 function Write-Log {
@@ -32,10 +36,7 @@ function Write-Log {
 
 # Check if running on on-prem Exchange
 try {
-    $exch = Get-Command Enable-DistributionGroup -ErrorAction Stop
-    if ($exch.Source -notlike "*Microsoft.Exchange.Management*") {
-        throw
-    }
+    Get-Command Enable-DistributionGroup -ErrorAction Stop | Out-Null
 } catch {
     Write-Error "This script must be run on an on-prem Exchange server with the Exchange Management Shell."
     exit 1
@@ -98,8 +99,46 @@ $failLog = Join-Path $logFolder ("Enable-BulkDistributionGroups_Fail_{0:yyyyMMdd
 $successList = @()
 $failList = @()
 
+
+
 foreach ($group in $toEnable) {
     try {
+        # Check if group is already a mail-enabled distribution group
+        $existingDG = $null
+        try {
+            $existingDG = Get-DistributionGroup -Identity $group.Name -ErrorAction Stop
+        } catch {
+            $existingDG = $null
+        }
+        if ($existingDG) {
+            Write-Log "SKIPPED: $($group.Name) <$($group.PrimarySMTPAddress)> is already a distribution group." "INFO"
+            $successList += [PSCustomObject]@{
+                Name = $group.Name
+                PrimarySMTPAddress = $group.PrimarySMTPAddress
+                HiddenFromGAL = $HiddenFromGAL
+                AllowExternal = $AllowExternal
+                Status = "AlreadyEnabled"
+            }
+            # Optionally, still set HiddenFromGAL if requested and not already set
+            if ($HiddenFromGAL -and -not $existingDG.HiddenFromAddressListsEnabled) {
+                try {
+                    Set-DistributionGroup -Identity $group.Name -HiddenFromAddressListsEnabled $true -ErrorAction Stop
+                    Write-Log "Set HiddenFromAddressListsEnabled for $($group.Name)"
+                } catch {
+                    Write-Log "FAILED to set HiddenFromAddressListsEnabled for $($group.Name): $_" "ERROR"
+                }
+            }
+            # Set AllowExternalSenders if requested and not already set
+            if ($AllowExternal -and -not $existingDG.AcceptMessagesOnlyFromSendersOrMembers) {
+                try {
+                    Set-DistributionGroup -Identity $group.Name -RequireSenderAuthenticationEnabled $false -ErrorAction Stop
+                    Write-Log "Set AllowExternalSenders for $($group.Name)"
+                } catch {
+                    Write-Log "FAILED to set AllowExternalSenders for $($group.Name): $_" "ERROR"
+                }
+            }
+            continue
+        }
         $params = @{
             Identity = $group.Name
             PrimarySmtpAddress = $group.PrimarySMTPAddress
@@ -108,11 +147,15 @@ foreach ($group in $toEnable) {
         if ($HiddenFromGAL) {
             Set-DistributionGroup -Identity $group.Name -HiddenFromAddressListsEnabled $true -ErrorAction Stop
         }
+        if ($AllowExternal) {
+            Set-DistributionGroup -Identity $group.Name -RequireSenderAuthenticationEnabled $false -ErrorAction Stop
+        }
         Write-Log "SUCCESS: Enabled $($group.Name) <$($group.PrimarySMTPAddress)>"
         $successList += [PSCustomObject]@{
             Name = $group.Name
             PrimarySMTPAddress = $group.PrimarySMTPAddress
             HiddenFromGAL = $HiddenFromGAL
+            AllowExternal = $AllowExternal
             Status = "Success"
         }
     } catch {
@@ -121,6 +164,7 @@ foreach ($group in $toEnable) {
             Name = $group.Name
             PrimarySMTPAddress = $group.PrimarySMTPAddress
             HiddenFromGAL = $HiddenFromGAL
+            AllowExternal = $AllowExternal
             Status = "Failed"
             Error = $_.Exception.Message
         }
