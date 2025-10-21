@@ -6,9 +6,11 @@ This PowerShell script automates the creation of Microsoft Teams groups using th
 
 - PowerShell 5.1 or higher
 - Microsoft Graph PowerShell SDK
+
   ```powershell
   Install-Module Microsoft.Graph -Scope CurrentUser
   ```
+  
 - Required permissions:
   - Group.ReadWrite.All
   - User.Read.All
@@ -17,6 +19,7 @@ This PowerShell script automates the creation of Microsoft Teams groups using th
 ## CSV File Format
 
 The input CSV file must contain the following columns:
+
 ```csv
 TeamName,OwnerUPN
 "Marketing Team","owner1@contoso.com"
@@ -40,11 +43,13 @@ TeamName,OwnerUPN
 ## Usage Examples
 
 1. Create teams without returning email addresses:
+
 ```powershell
 .\Create-TeamsGroup.ps1 -CsvPath ".\teams.csv"
 ```
 
-2. Create teams and get the general channel email addresses:
+1. Create teams and get the general channel email addresses:
+
 ```powershell
 .\Create-TeamsGroup.ps1 -CsvPath ".\teams.csv" -ReturnTeamsEmail $true
 ```
@@ -52,6 +57,7 @@ TeamName,OwnerUPN
 ## Output
 
 The script returns a table with the following information for each team:
+
 - TeamName: The name of the team
 - Status: Creation status (success or failure message)
 - TeamId: The unique identifier for the created team
@@ -60,6 +66,7 @@ The script returns a table with the following information for each team:
 ## Error Handling
 
 The script includes comprehensive error handling for:
+
 - Missing or invalid CSV file
 - Incorrect CSV structure
 - Failed team creation
