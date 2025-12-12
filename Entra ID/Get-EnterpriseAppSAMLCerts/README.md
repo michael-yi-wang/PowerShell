@@ -22,6 +22,7 @@ Results can be exported to a CSV file for audit purposes or certificate expirati
 ## Installation
 
 1. Install the Microsoft Graph PowerShell module:
+
    ```powershell
    Install-Module -Name Microsoft.Graph -Scope CurrentUser
    ```
@@ -71,7 +72,7 @@ The script generates a table or CSV file containing the following information fo
 
 ## Example Output
 
-```
+```powershell
 AppName                    CertificateExpirationDate
 -------                    ------------------------
 Slack                      2024-12-31
@@ -102,6 +103,7 @@ The script uses verbose output for troubleshooting. Run with the `-Verbose` flag
 ### "The specified module 'Microsoft.Graph' could not be loaded"
 
 Install the required module:
+
 ```powershell
 Install-Module -Name Microsoft.Graph
 ```
