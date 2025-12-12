@@ -1,23 +1,48 @@
 <#
 .SYNOPSIS
-    Retrieve all Enterprise Applications (Service Principals) with SAML SSO configured.
+    Retrieves SAML-configured Enterprise Applications and their certificate details from Azure AD.
 
 .DESCRIPTION
-    Connects to Microsoft Graph for the provided Tenant, retrieves Enterprise Applications with SAML SSO configured,
-    and returns App Name, URI, Certificate Thumbprint, and Certificate Expiration Date.
-    Can export results to a CSV file if an output folder is specified.
+    This script connects to Microsoft Graph and retrieves all Enterprise Applications (Service Principals) 
+    configured with SAML Single Sign-On. It extracts and displays certificate information including the 
+    certificate thumbprint and expiration date for each SAML-enabled application.
+    
+    Results can be exported to a CSV file for audit purposes or certificate expiration tracking.
 
 .PARAMETER Tenant
-    The target Azure AD tenant ID or Domain.
+    Specifies the target Azure AD tenant ID or fully qualified domain name (FQDN).
+    Example: "contoso.onmicrosoft.com" or "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 
 .PARAMETER Output
-    Optional. The folder path to save the CSV report. If not specified, output is displayed on screen.
+    Specifies an optional folder path where the CSV report will be saved. 
+    If this parameter is not provided, results are displayed in the console only.
+    Example: "C:\Reports" or "C:\temp\EnterpriseAppCerts.csv"
 
 .EXAMPLE
-    .\Get-EnterpriseApp.ps1 -Tenant "contoso.onmicrosoft.com"
+    .\Get-EnterpriseAppSAMLCerts.ps1 -Tenant "contoso.onmicrosoft.com"
+    
+    Retrieves and displays SAML enterprise application certificates from the specified tenant.
 
 .EXAMPLE
-    .\Get-EnterpriseApp.ps1 -Tenant "contoso.onmicrosoft.com" -Output "C:\Reports"
+    .\Get-EnterpriseAppSAMLCerts.ps1 -Tenant "contoso.onmicrosoft.com" -Output "C:\Reports"
+    
+    Retrieves SAML enterprise application certificates and exports the results to a CSV file in the specified directory.
+
+.NOTES
+    Author: 
+    Date:
+    Version: 1.0
+    
+    Prerequisites:
+    - Microsoft.Graph PowerShell module must be installed and imported
+    - User must have sufficient permissions to read Enterprise Applications in Azure AD
+    
+    Requires the following Microsoft Graph permissions:
+    - Application.Read.All
+
+.LINK
+    https://docs.microsoft.com/en-us/graph/api/serviceprincipal-list?view=graph-rest-1.0
+
 #>
 
 [CmdletBinding()]
