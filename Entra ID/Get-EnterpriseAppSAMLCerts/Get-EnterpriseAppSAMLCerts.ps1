@@ -29,8 +29,8 @@
     Retrieves SAML enterprise application certificates and exports the results to a CSV file in the specified directory.
 
 .NOTES
-    Author: 
-    Date:
+    Author: Michael
+    Date: December 12, 2025
     Version: 1.0
     
     Prerequisites:
@@ -78,7 +78,7 @@ process {
 
             $results += [PSCustomObject]@{
                 AppName = $app.DisplayName
-                CertificateExpirationDate = $appCertInfo.KeyCredentials.endDateTime[0]
+                CertificateExpirationDate = $appCertInfo.KeyCredentials.endDateTime[0].ToString("yyyy-MM-dd")
             }
         }
 
@@ -89,7 +89,7 @@ process {
             }
             $fileName = "SAML_Apps_Report_$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
             $fullPath = Join-Path -Path $Output -ChildPath $fileName
-            $results | Export-Csv -Path $fullPath -NoTypeInformation
+            $results | Export-Csv -Path $fullPath -NoTypeInformation -Encoding UTF8
             Write-Host "Report saved to: $fullPath" -ForegroundColor Green
         }
         else {
