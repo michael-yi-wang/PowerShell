@@ -54,13 +54,55 @@ function Write-Log {
     $LogEntry | Out-File -FilePath $LogFile -Append
 }
 
+function Get-PimGroupApprovalStatus {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$GroupId,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$AccessId # 'member' or 'owner'
+    )
+    
+    try {
+        # PIM for Groups policy ID pattern: group_{member/owner}_{groupId}
+        # However, it's safer to find the assignment for the specific group scope.
+        # scopeId for groups in PIM for Groups is just the GroupId, and scopeType is 'Group'
+        $Assignment = Get-MgPolicyRoleManagementPolicyAssignment -Filter "scopeId eq '$GroupId' and scopeType eq 'Group' and roleDefinitionId eq '$AccessId'" -ErrorAction Stop
+        
+        if ($null -ne $Assignment) {
+            $PolicyId = $Assignment.PolicyId
+            $Rules = Get-MgPolicyRoleManagementPolicyRule -UnifiedRoleManagementPolicyId $PolicyId -ErrorAction Stop
+            
+            # The rule ID for approval is usually 'Approval_EndUser_Assignment'
+            $ApprovalRule = $Rules | Where-Object { $_.Id -eq "Approval_EndUser_Assignment" }
+            
+            if ($null -ne $ApprovalRule) {
+                # In the SDK, settings are often in AdditionalProperties
+                $Setting = $ApprovalRule.AdditionalProperties["setting"]
+                if ($null -ne $Setting -and $Setting["isApprovalRequired"]) {
+                    return $true
+                }
+            }
+        }
+    }
+    catch {
+        Write-Log -Level Warning -Message "Could not verify approval requirement for Group $GroupId ($AccessId): $($_.Exception.Message)"
+    }
+    
+    return $false
+}
+
 # --- Main Execution ---
 try {
     Write-Log -Level Info -Message "Starting Interactive PIM Group Activation..."
 
     # Check for required modules
-    if (-not (Get-Module -ListAvailable Microsoft.Graph.Identity.Governance)) {
-        throw "Microsoft.Graph.Identity.Governance module is required. Please install it using 'Install-Module Microsoft.Graph'."
+    $RequiredModules = @("Microsoft.Graph.Identity.Governance", "Microsoft.Graph.Identity.SignIns")
+    foreach ($Module in $RequiredModules) {
+        if (-not (Get-Module -ListAvailable $Module)) {
+            throw "$Module module is required. Please install it using 'Install-Module Microsoft.Graph'."
+        }
     }
 
     # Authentication
@@ -70,7 +112,9 @@ try {
         "PrivilegedAssignmentSchedule.Read.AzureADGroup",
         "PrivilegedEligibilitySchedule.Read.AzureADGroup",
         "PrivilegedAccess.Read.AzureADGroup",
-        "Directory.Read.All"
+        "Directory.Read.All",
+        "RoleManagement.Read.Directory",
+        "RoleManagementPolicy.Read.AzureADGroup"
     )
     Connect-MgGraph -Scopes $Scopes | Out-Null
 
@@ -106,28 +150,53 @@ try {
 
         # Build Display List
         $DisplayList = [System.Collections.Generic.List[PSObject]]::new()
+        $ApprovalRequiredList = [System.Collections.Generic.List[PSObject]]::new()
+
         foreach ($Eligible in $Eligibilities) {
             $IsActive = $null -ne ($ActiveAssignments | Where-Object { $_.GroupId -eq $Eligible.GroupId -and $_.AccessId -eq $Eligible.AccessId })
             
             # Get Group Name
             $GroupName = try { (Get-MgGroup -GroupId $Eligible.GroupId).DisplayName } catch { $Eligible.GroupId }
 
-            $DisplayList.Add([PSCustomObject]@{
-                    Index     = $DisplayList.Count + 1
-                    GroupName = $GroupName
-                    Access    = $Eligible.AccessId
-                    Status    = if ($IsActive) { "Already Active" } else { "Eligible" }
-                    GroupId   = $Eligible.GroupId
-                    AccessId  = $Eligible.AccessId
-                })
+            # Check if approval is required
+            $RequiresApproval = Get-PimGroupApprovalStatus -GroupId $Eligible.GroupId -AccessId $Eligible.AccessId
+
+            $Item = [PSCustomObject]@{
+                GroupName        = $GroupName
+                Access           = $Eligible.AccessId
+                Status           = if ($IsActive) { "Already Active" } else { "Eligible" }
+                RequiresApproval = $RequiresApproval
+                GroupId          = $Eligible.GroupId
+                AccessId         = $Eligible.AccessId
+            }
+
+            if ($RequiresApproval -and -not $IsActive) {
+                $ApprovalRequiredList.Add($Item)
+            }
+            else {
+                $Item | Add-Member -MemberType NoteProperty -Name Index -Value ($DisplayList.Count + 1)
+                $DisplayList.Add($Item)
+            }
         }
 
-        # Show Table
-        $DisplayList | Format-Table Index, GroupName, Access, Status -AutoSize
+        # Show Table - Direct Activation
+        if ($DisplayList.Count -gt 0) {
+            Write-Host "Eligible Groups (Direct Activation):" -ForegroundColor Green
+            $DisplayList | Format-Table Index, GroupName, Access, Status -AutoSize
+        }
+
+        # Show Table - Approval Required
+        if ($ApprovalRequiredList.Count -gt 0) {
+            Write-Host "Eligible Groups (Approval Required - Activate via Azure Portal):" -ForegroundColor Yellow
+            $ApprovalRequiredList | Format-Table GroupName, Access -AutoSize
+            Write-Host "Note: Groups requiring approval must be activated manually in the Azure Portal:" -ForegroundColor Gray
+            Write-Host "      https://portal.azure.com/#view/Microsoft_AAD_PIMCommon/PimMenuBlade/~/MyRoles" -ForegroundColor Gray
+            Write-Host ""
+        }
 
         Write-Host "Options:"
         Write-Host " [1-$($DisplayList.Count)] Activate specific group"
-        Write-Host " [A] Activate ALL eligible groups"
+        Write-Host " [A] Activate ALL eligible groups (Direct Activation only)"
         Write-Host " [R] Refresh list"
         Write-Host " [Q] Quit"
         Write-Host ""
