@@ -4,15 +4,25 @@ An interactive PowerShell script to manage and activate **Microsoft Entra ID Pri
 
 ## Overview
 
-`Invoke-PimGroupActivation.ps1` simplifies the process of activating eligible group assignments. It provides an interactive menu that allows users to view their current eligibility status, see which groups are already active, and perform single or bulk activations directly from the console.
+`Invoke-PimGroupActivation.ps1` simplifies the process of activating eligible group assignments. It provides an interactive menu that allows users to view their current eligibility status, identifies which groups require approval, and perform single or bulk activations for groups that do not require approval directly from the console.
 
 ## Features
 
-- **Interactive Menu:** Easily select specific groups or activate all eligible groups at once.
+- **Interactive Menu:** Easily select specific groups or activate all eligible groups (that don't require approval) at once.
+- **Approval Detection:** Automatically identifies groups that require approval for activation.
+- **Security Logic:** To maintain security integrity, groups requiring approval (typically high-privilege groups like Global Admins) are restricted from direct activation within the script.
+- **Portal Redirection:** Provides instructions and a direct link to the Azure Portal for groups requiring approval.
 - **Real-time Status:** Distinguishes between "Eligible" and "Already Active" assignments.
 - **Automated Logging:** Detailed execution logs are saved with timestamps.
 - **Results Export:** Final activation results are exported to a CSV file for auditing.
 - **Cross-Platform:** Designed for PowerShell 7+.
+
+## Interactive Menu Behavior
+
+The script categorizes eligible groups into two sections:
+
+1. **Direct Activation:** These groups do not require approval. You can activate them individually by index or all at once using the `[A]` option.
+2. **Approval Required:** These groups require an approval workflow. Because these often involve sensitive permissions, the script redirects you to the Microsoft Entra admin center to initiate the request, ensuring the full security context and approver notifications are handled correctly by the platform.
 
 ## Prerequisites
 
@@ -20,7 +30,7 @@ An interactive PowerShell script to manage and activate **Microsoft Entra ID Pri
 - **PowerShell 7.x** (Core) is recommended for cross-platform compatibility.
 
 ### 2. Required Modules
-The script requires the Microsoft Graph PowerShell SDK.
+The script requires the Microsoft Graph PowerShell SDK (Governance and SignIns modules).
 ```powershell
 Install-Module Microsoft.Graph -Scope CurrentUser
 ```
@@ -32,6 +42,8 @@ The script requests the following delegated scopes during interactive login:
 - `PrivilegedEligibilitySchedule.Read.AzureADGroup`
 - `PrivilegedAccess.Read.AzureADGroup`
 - `Directory.Read.All`
+- `RoleManagement.Read.Directory` (Used to check PIM policy settings)
+- `RoleManagementPolicy.Read.AzureADGroup` (Required to read PIM for Groups policies)
 
 ## Usage
 
