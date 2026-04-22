@@ -22,7 +22,9 @@ param (
     [Parameter(Mandatory = $true)]
     [string]$Justification,
 
-    [string]$Duration = "PT10H"
+    [string]$Duration = "PT10H",
+
+    [switch]$IncludeApproveRequestGroup = $false
 )
 
 # --- Configuration & Logging ---
@@ -54,7 +56,7 @@ function Write-Log {
     $LogEntry | Out-File -FilePath $LogFile -Append
 }
 
-function Get-PimGroupApprovalStatus {
+function Get-PimGroupAssignmentPolicyDetails {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
@@ -64,33 +66,51 @@ function Get-PimGroupApprovalStatus {
         [string]$AccessId # 'member' or 'owner'
     )
     
+    $Details = [PSCustomObject]@{
+        IsApprovalRequired = $false
+        MaximumDuration    = $null
+    }
+
     try {
         # PIM for Groups policy ID pattern: group_{member/owner}_{groupId}
-        # However, it's safer to find the assignment for the specific group scope.
-        # scopeId for groups in PIM for Groups is just the GroupId, and scopeType is 'Group'
         $Assignment = Get-MgPolicyRoleManagementPolicyAssignment -Filter "scopeId eq '$GroupId' and scopeType eq 'Group' and roleDefinitionId eq '$AccessId'" -ErrorAction Stop
         
         if ($null -ne $Assignment) {
             $PolicyId = $Assignment.PolicyId
             $Rules = Get-MgPolicyRoleManagementPolicyRule -UnifiedRoleManagementPolicyId $PolicyId -ErrorAction Stop
             
-            # The rule ID for approval is usually 'Approval_EndUser_Assignment'
+            # 1. Check Approval Rule
             $ApprovalRule = $Rules | Where-Object { $_.Id -eq "Approval_EndUser_Assignment" }
-            
             if ($null -ne $ApprovalRule) {
-                # In the SDK, settings are often in AdditionalProperties
                 $Setting = $ApprovalRule.AdditionalProperties["setting"]
                 if ($null -ne $Setting -and $Setting["isApprovalRequired"]) {
-                    return $true
+                    $Details.IsApprovalRequired = $true
+                }
+            }
+
+            # 2. Check Expiration Rule
+            $ExpirationRule = $Rules | Where-Object { $_.Id -eq "Expiration_EndUser_Assignment" }
+            if ($null -ne $ExpirationRule) {
+                # In the SDK, settings are often in AdditionalProperties
+                # The property name in Graph is usually maximumDuration
+                if ($ExpirationRule.AdditionalProperties.ContainsKey("maximumDuration")) {
+                    $Details.MaximumDuration = $ExpirationRule.AdditionalProperties["maximumDuration"]
+                }
+                # For some SDK versions it might be in 'maximumDuration' directly or in 'setting'
+                elseif ($ExpirationRule.AdditionalProperties.ContainsKey("setting")) {
+                    $Setting = $ExpirationRule.AdditionalProperties["setting"]
+                    if ($null -ne $Setting -and $Setting["maximumDuration"]) {
+                        $Details.MaximumDuration = $Setting["maximumDuration"]
+                    }
                 }
             }
         }
     }
     catch {
-        Write-Log -Level Warning -Message "Could not verify approval requirement for Group $GroupId ($AccessId): $($_.Exception.Message)"
+        Write-Log -Level Warning -Message "Could not verify policy details for Group $GroupId ($AccessId): $($_.Exception.Message)"
     }
     
-    return $false
+    return $Details
 }
 
 # --- Main Execution ---
@@ -158,45 +178,58 @@ try {
             # Get Group Name
             $GroupName = try { (Get-MgGroup -GroupId $Eligible.GroupId).DisplayName } catch { $Eligible.GroupId }
 
-            # Check if approval is required
-            $RequiresApproval = Get-PimGroupApprovalStatus -GroupId $Eligible.GroupId -AccessId $Eligible.AccessId
+            # Check policy details
+            $PolicyDetails = Get-PimGroupAssignmentPolicyDetails -GroupId $Eligible.GroupId -AccessId $Eligible.AccessId
+            $RequiresApproval = $PolicyDetails.IsApprovalRequired
 
             $Item = [PSCustomObject]@{
                 GroupName        = $GroupName
                 Access           = $Eligible.AccessId
                 Status           = if ($IsActive) { "Already Active" } else { "Eligible" }
                 RequiresApproval = $RequiresApproval
+                MaximumDuration  = $PolicyDetails.MaximumDuration
                 GroupId          = $Eligible.GroupId
                 AccessId         = $Eligible.AccessId
             }
 
-            if ($RequiresApproval -and -not $IsActive) {
-                $ApprovalRequiredList.Add($Item)
-            }
-            else {
+            # Determine if we can activate it in this session
+            # Already active groups go into DisplayList regardless of approval status.
+            # Eligible groups go into DisplayList ONLY if they don't require approval OR if IncludeApproveRequestGroup is set.
+            $CanInteractiveActivate = $IsActive -or (-not $RequiresApproval) -or $IncludeApproveRequestGroup
+
+            if ($CanInteractiveActivate) {
                 $Item | Add-Member -MemberType NoteProperty -Name Index -Value ($DisplayList.Count + 1)
                 $DisplayList.Add($Item)
             }
+            else {
+                $ApprovalRequiredList.Add($Item)
+            }
         }
 
-        # Show Table - Direct Activation
+        # Show Table - Selectable Groups
         if ($DisplayList.Count -gt 0) {
-            Write-Host "Eligible Groups (Direct Activation):" -ForegroundColor Green
-            $DisplayList | Format-Table Index, GroupName, Access, Status -AutoSize
+            Write-Host "Eligible Groups (Selectable):" -ForegroundColor Green
+            $DisplayList | Format-Table Index, GroupName, Access, Status, RequiresApproval -AutoSize
+            
+            # Tip when parameter is $TRUE
+            if ($IncludeApproveRequestGroup -and ($DisplayList | Where-Object { $_.RequiresApproval -and $_.Status -eq "Eligible" })) {
+                Write-Host "Tip: Some selected groups require approval. Activation requests will remain pending until approved." -ForegroundColor Cyan
+            }
         }
 
-        # Show Table - Approval Required
+        # Show Table - Approval Required (Non-selectable)
         if ($ApprovalRequiredList.Count -gt 0) {
-            Write-Host "Eligible Groups (Approval Required - Activate via Azure Portal):" -ForegroundColor Yellow
+            Write-Host "Eligible Groups (Approval Required):" -ForegroundColor Yellow
             $ApprovalRequiredList | Format-Table GroupName, Access -AutoSize
-            Write-Host "Note: Groups requiring approval must be activated manually in the Azure Portal:" -ForegroundColor Gray
-            Write-Host "      https://portal.azure.com/#view/Microsoft_AAD_PIMCommon/PimMenuBlade/~/MyRoles" -ForegroundColor Gray
+            
+            # Tip when parameter is $FALSE
+            Write-Host "Tip: To activate groups requiring approval via this script, use: -IncludeApproveRequestGroup `$true" -ForegroundColor Cyan
             Write-Host ""
         }
 
         Write-Host "Options:"
         Write-Host " [1-$($DisplayList.Count)] Activate specific group"
-        Write-Host " [A] Activate ALL eligible groups (Direct Activation only)"
+        Write-Host " [A] Activate ALL eligible groups"
         Write-Host " [R] Refresh list"
         Write-Host " [Q] Quit"
         Write-Host ""
@@ -235,7 +268,23 @@ try {
         # Process Activations
         foreach ($Item in $ToActivate) {
             Write-Log -Level Info -Message "Activating '$($Item.GroupName)' ($($Item.Access))..."
-            
+
+            $TargetDuration = $Duration
+            try {
+                if ($null -ne $Item.MaximumDuration) {
+                    $RequestedTS = [System.Xml.XmlConvert]::ToTimeSpan($Duration)
+                    $MaxTS = [System.Xml.XmlConvert]::ToTimeSpan($Item.MaximumDuration)
+
+                    if ($RequestedTS -gt $MaxTS) {
+                        Write-Log -Level Warning -Message "Requested duration $Duration exceeds maximum allowed ($($Item.MaximumDuration)) for '$($Item.GroupName)'. Adjusting to max."
+                        $TargetDuration = $Item.MaximumDuration
+                    }
+                }
+            }
+            catch {
+                Write-Log -Level Warning -Message "Failed to compare durations for '$($Item.GroupName)'. Using default $Duration."
+            }
+
             $Params = @{
                 AccessId      = $Item.AccessId
                 PrincipalId   = $PrincipalId
@@ -246,7 +295,7 @@ try {
                     StartDateTime = [System.DateTime]::UtcNow
                     Expiration    = @{
                         Type     = "afterDuration"
-                        Duration = $Duration
+                        Duration = $TargetDuration
                     }
                 }
             }

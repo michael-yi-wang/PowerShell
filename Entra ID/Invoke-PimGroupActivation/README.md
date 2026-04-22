@@ -4,14 +4,15 @@ An interactive PowerShell script to manage and activate **Microsoft Entra ID Pri
 
 ## Overview
 
-`Invoke-PimGroupActivation.ps1` simplifies the process of activating eligible group assignments. It provides an interactive menu that allows users to view their current eligibility status, identifies which groups require approval, and perform single or bulk activations for groups that do not require approval directly from the console.
+`Invoke-PimGroupActivation.ps1` simplifies the process of activating eligible group assignments. It provides an interactive menu that allows users to view their current eligibility status, identifies which groups require approval, and perform single or bulk activations directly from the console.
 
 ## Features
 
-- **Interactive Menu:** Easily select specific groups or activate all eligible groups (that don't require approval) at once.
+- **Interactive Menu:** Easily select specific groups or activate all eligible groups at once.
 - **Approval Detection:** Automatically identifies groups that require approval for activation.
-- **Security Logic:** To maintain security integrity, groups requiring approval (typically high-privilege groups like Global Admins) are restricted from direct activation within the script.
-- **Portal Redirection:** Provides instructions and a direct link to the Azure Portal for groups requiring approval.
+- **Optional Approval Workflow:** By default, sensitive groups requiring approval are filtered out to prevent accidental requests, but they can be included using a specific parameter.
+- **Automatic Duration Enforcement:** The script automatically checks the PIM policy for each group and adjusts your requested duration if it exceeds the maximum allowed by the organization (e.g., if you request 10 hours but a group allows only 4).
+- **Portal Redirection:** Provides a direct link to the Microsoft Entra admin center for manual management.
 - **Real-time Status:** Distinguishes between "Eligible" and "Already Active" assignments.
 - **Automated Logging:** Detailed execution logs are saved with timestamps.
 - **Results Export:** Final activation results are exported to a CSV file for auditing.
@@ -19,10 +20,12 @@ An interactive PowerShell script to manage and activate **Microsoft Entra ID Pri
 
 ## Interactive Menu Behavior
 
-The script categorizes eligible groups into two sections:
+The script displays eligible groups in two sections:
 
-1. **Direct Activation:** These groups do not require approval. You can activate them individually by index or all at once using the `[A]` option.
-2. **Approval Required:** These groups require an approval workflow. Because these often involve sensitive permissions, the script redirects you to the Microsoft Entra admin center to initiate the request, ensuring the full security context and approver notifications are handled correctly by the platform.
+1. **Selectable Groups:** These are groups you can activate immediately through the script. 
+   - By default, this only includes groups that **do not** require approval.
+   - If you use the `-IncludeApproveRequestGroup` parameter, groups requiring approval are added to this list.
+2. **Approval Required (View Only):** If the script is run without the include parameter, these groups are displayed for visibility only. The script will provide a tip on how to enable activation for them.
 
 ## Prerequisites
 
@@ -49,7 +52,7 @@ The script requests the following delegated scopes during interactive login:
 
 ### Syntax
 ```powershell
-.\Invoke-PimGroupActivation.ps1 -Justification <String> [-Duration <String>]
+.\Invoke-PimGroupActivation.ps1 -Justification <String> [-Duration <String>] [-IncludeApproveRequestGroup]
 ```
 
 ### Parameters
@@ -58,12 +61,22 @@ The script requests the following delegated scopes during interactive login:
 | :--- | :--- | :--- | :--- | :--- |
 | `Justification` | String | Yes | - | The business reason for the PIM activation. |
 | `Duration` | String | No | `PT10H` | Activation duration in ISO 8601 format (e.g., `PT8H` for 8 hours). |
+| `IncludeApproveRequestGroup` | Switch | No | `$false` | When set, allows the script to submit activation requests for groups that require approval. |
 
-### Example
-Activate groups for a system maintenance window:
+### Examples
+
+**Standard Activation (No approval required):**
 ```powershell
-.\Invoke-PimGroupActivation.ps1 -Justification "Monthly System Maintenance" -Duration "PT4H"
+.\Invoke-PimGroupActivation.ps1 -Justification "Routine maintenance"
 ```
+
+**Full Activation (Including groups requiring approval):**
+```powershell
+.\Invoke-PimGroupActivation.ps1 -Justification "Emergency Fix" -IncludeApproveRequestGroup
+```
+
+## Policy Enforcement
+To prevent "Bad Request" errors, the script performs a policy check for every group. If your requested `-Duration` (e.g., 10 hours) is longer than what the specific group policy allows (e.g., 4 hours for Global Admins), the script will automatically scale the request down to the maximum allowed limit and notify you in the log.
 
 ## Logging & Output
 
