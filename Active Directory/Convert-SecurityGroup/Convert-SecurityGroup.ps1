@@ -250,11 +250,11 @@ if ($toChange.Count -gt 0) {
     $toChange | ForEach-Object {
         $conflictText = ""
         if ($_.ParentConflicts.Count -gt 0) {
-            $conflictText += "PARENT CONFLICT: " + ($_.ParentConflicts | ForEach-Object { $_.Name } -join ', ')
+            $conflictText += "PARENT CONFLICT: " + (( $_.ParentConflicts | ForEach-Object { $_.Name } ) -join ', ')
         }
         if ($_.MemberConflicts.Count -gt 0) {
             if ($conflictText) { $conflictText += "; " }
-            $conflictText += "MEMBER CONFLICT: " + ($_.MemberConflicts | ForEach-Object { $_.Name } -join ', ')
+            $conflictText += "MEMBER CONFLICT: " + (( $_.MemberConflicts | ForEach-Object { $_.Name } ) -join ', ')
         }
         Write-Host ("- {0}  (current: {1} -> target: {2}) {3}" -f $_.Name, $_.CurrentScope, $_.TargetScope, $conflictText)
     }

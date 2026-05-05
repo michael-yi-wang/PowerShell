@@ -1,4 +1,4 @@
-# gire all .bak files
+# ignore all .bak files
 *.bak
 # ignore all csv and xlsx / xls files
 *.csv
@@ -14,3 +14,10 @@
 .vscode/
 # log files
 *.log
+# gemini files
+GEMINI.md
+.gemini
+*/conductor/*
+# Claude files
+CLAUDE.md
+.claude
