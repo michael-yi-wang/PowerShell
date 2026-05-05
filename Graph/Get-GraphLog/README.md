@@ -135,24 +135,11 @@ openssl x509 -in cert.pem -outform DER -out M365AuditLogHelpdesk.cer
 
 ### Step 5 — Distribute the Certificate to Helpdesk Agent Machines
 
-Each helpdesk agent must import `M365AuditLogHelpdesk.pfx` into their personal certificate store once.
+How agents use the certificate depends on their operating system.
 
-#### Windows
+#### Windows — import into certificate store (recommended)
 
-```powershell
-# Run once per agent machine
-$PfxPassword = Read-Host "Enter the .pfx password" -AsSecureString
-Import-PfxCertificate -FilePath "M365AuditLogHelpdesk.pfx" `
-    -CertStoreLocation "Cert:\CurrentUser\My" `
-    -Password $PfxPassword
-
-# Confirm import and retrieve the thumbprint
-Get-ChildItem Cert:\CurrentUser\My |
-    Where-Object { $_.Subject -like "*M365-AuditLog*" } |
-    Select-Object Subject, Thumbprint, NotAfter
-```
-
-#### macOS / Linux (PowerShell 7)
+Import the `.pfx` once per machine. After import, agents use `-CertificateThumbprint` with no password prompt at runtime.
 
 ```powershell
 # Run once per agent machine
@@ -167,13 +154,26 @@ Get-ChildItem Cert:\CurrentUser\My |
     Select-Object Subject, Thumbprint, NotAfter
 ```
 
-Once imported, agents use the `-CertificateThumbprint` parameter (no password prompt at runtime).
+Then run the script with:
+```powershell
+.\Get-GraphLog.ps1 -TenantId "..." -ClientId "..." -CertificateThumbprint "<thumbprint>"
+```
+
+#### macOS / Linux — use .pfx file directly
+
+The `Cert:` certificate store drive is **not available on macOS or Linux**. Distribute the `.pfx` file to each agent and use `-CertificatePath` instead:
+
+```powershell
+.\Get-GraphLog.ps1 -TenantId "..." -ClientId "..." -CertificatePath "/path/to/M365AuditLogHelpdesk.pfx"
+```
+
+The script will prompt for the `.pfx` password on first run. Store the `.pfx` in a secure location on the agent's machine (e.g. `~/Keys/` with `chmod 600`).
 
 ---
 
 ## Usage
 
-### Recommended — certificate imported in local store
+### Windows — certificate imported in local store (recommended)
 
 ```powershell
 .\Get-GraphLog.ps1 `
@@ -182,14 +182,16 @@ Once imported, agents use the `-CertificateThumbprint` parameter (no password pr
     -CertificateThumbprint "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2"
 ```
 
-### Alternative — load certificate directly from .pfx file
+### macOS / Linux — load certificate from .pfx file
+
+> The `Cert:` store drive is not available on macOS/Linux. Use `-CertificatePath` instead.
 
 ```powershell
 # Will prompt for the .pfx password interactively
 .\Get-GraphLog.ps1 `
     -TenantId "contoso.onmicrosoft.com" `
     -ClientId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-    -CertificatePath "C:\Certs\M365AuditLogHelpdesk.pfx"
+    -CertificatePath "/path/to/M365AuditLogHelpdesk.pfx"
 ```
 
 Once launched, an interactive menu is displayed. The agent selects a service, enters the target (UPN, URL, or team name), specifies the date range, and the script retrieves and exports the results.

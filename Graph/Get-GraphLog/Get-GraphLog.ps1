@@ -210,11 +210,23 @@ function Connect-ToGraph {
                 $Script:CertificatePassword = Read-Host -Prompt 'Enter certificate (.pfx) password' -AsSecureString
             }
             Write-Log "Loading certificate from file: $CertificatePath"
-            $Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
-                (Resolve-Path $CertificatePath).Path,
-                $Script:CertificatePassword,
-                [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
-            )
+            $ResolvedPath = (Resolve-Path $CertificatePath).Path
+            try {
+                # EphemeralKeySet avoids writing the private key to disk — preferred but not supported on macOS
+                $Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+                    $ResolvedPath,
+                    $Script:CertificatePassword,
+                    [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+                )
+            }
+            catch {
+                # Fall back to default key storage (macOS / Linux)
+                Write-Log 'EphemeralKeySet not supported on this platform — using default key storage.' -Level Warning
+                $Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+                    $ResolvedPath,
+                    $Script:CertificatePassword
+                )
+            }
             Connect-MgGraph -TenantId $TenantId -ClientId $ClientId `
                 -Certificate $Cert -NoWelcome -ErrorAction Stop
         }
