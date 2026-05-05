@@ -24,7 +24,7 @@ An interactive PowerShell tool for helpdesk agents to retrieve unified audit log
 |---|---|
 | PowerShell | 7.x (cross-platform) |
 | Module | `Microsoft.Graph.Authentication` |
-| Azure AD App | App Registration with `AuditLog.Read.All` and a certificate (see setup below) |
+| Azure AD App | App Registration with `AuditLogsQuery.Read.All` and a certificate (see setup below) |
 
 Install the required module:
 
@@ -64,7 +64,10 @@ Follow these steps once as an admin. Required role: **Application Administrator*
 
    | Permission | Type | Purpose |
    |---|---|---|
-   | `AuditLog.Read.All` | Application | Read all unified audit log data |
+   | `AuditLogsQuery.Read.All` | Application | Read Microsoft Purview Unified Audit Log (required for this script) |
+   | `AuditLog.Read.All` | Application | Read Azure AD sign-in and directory audit logs (optional) |
+
+   > **Important:** `AuditLogsQuery.Read.All` and `AuditLog.Read.All` are **different permissions**. This script uses the Microsoft Purview Audit Log Search API (`/beta/security/auditLog/queries`) which specifically requires `AuditLogsQuery.Read.All`.
 
 4. Click **Add permissions**.
 5. Click **Grant admin consent for [your tenant]** and confirm.
@@ -214,20 +217,39 @@ Once launched, an interactive menu is displayed. The agent selects a service, en
 
 ### Exchange Online — by User UPN
 
-Retrieves all mailbox audit events for the specified user. Includes operations such as:
+Retrieves all mailbox audit events for the specified user across five record types:
+`exchangeItem`, `exchangeItemGroup`, `exchangeItemAggregated`, `exchangeAdmin`, `exchangeSearch`
 
-| Operation | Description |
-|---|---|
-| `HardDelete` | Message permanently deleted |
-| `SoftDelete` | Message moved to Recoverable Items |
-| `Move` | Message moved between folders |
-| `MoveToDeletedItems` | Message moved to Deleted Items |
-| `SendAs` | Email sent using Send As permission |
-| `SendOnBehalf` | Email sent using Send On Behalf |
-| `Create` | Item created in mailbox |
-| `Update` | Item updated |
-| `Copy` | Item copied |
-| `FolderBind` | Folder accessed |
+**Covered operations:**
+
+| Operation | Description | Enabled by Default? |
+|---|---|---|
+| `HardDelete` | Message permanently deleted | Yes |
+| `SoftDelete` | Message moved to Recoverable Items (Purges) | Yes |
+| `MoveToDeletedItems` | Message moved to Deleted Items folder | Yes |
+| `Move` | Message moved to any other folder | **No — must be enabled per mailbox** |
+| `SendAs` | Email sent as another user | Yes |
+| `SendOnBehalf` | Email sent on behalf of another user | Yes |
+| `Create` | Item created in mailbox | Yes |
+| `Update` | Item properties updated | Yes |
+| `Copy` | Item copied to another folder | Yes |
+| `FolderBind` | Folder opened/accessed | Yes (delegates/admins) |
+| `UpdateFolderPermissions` | Folder permissions changed | Yes |
+| `UpdateInboxRules` | Inbox rules added/modified/removed | Yes |
+| `UpdateCalendarDelegation` | Calendar delegation changed | Yes |
+| `MailItemsAccessed` | Mail items accessed (forensic) | **E5 / Purview Audit Premium only** |
+| `Set-Mailbox` / admin cmdlets | Admin configuration changes | Yes (via `exchangeAdmin`) |
+| `SearchQueryInitiated` | Mailbox search performed | Yes (via `exchangeSearch`) |
+
+> **Important — `Move` operations are NOT audited by default.** To enable them per mailbox:
+> ```powershell
+> Set-Mailbox -Identity user@contoso.com `
+>     -AuditOwner    @{Add='Move','MoveToDeletedItems'} `
+>     -AuditDelegate @{Add='Move','MoveToDeletedItems'} `
+>     -AuditAdmin    @{Add='Move','MoveToDeletedItems'}
+> ```
+
+> **`MailItemsAccessed`** is captured via `exchangeItemAggregated` and requires a **Microsoft 365 E5** or **Microsoft Purview Audit Premium** licence. It will return no records on E3 tenants.
 
 The **LogonType** column indicates who accessed the mailbox:
 
@@ -241,11 +263,23 @@ The **LogonType** column indicates who accessed the mailbox:
 
 ### SharePoint — by Site URL
 
-Retrieves all activity on a SharePoint site. Common operations include:
+Retrieves all activity on a SharePoint site across nine record types covering the full activity surface:
+`sharePoint`, `sharePointFileOperation`, `sharePointListItemOperation`, `sharePointSharingOperation`,
+`sharePointCommentOperation`, `sharePointListOperation`, `sharePointContentTypeOperation`,
+`sharePointFieldOperation`, `sharePointSearch`
 
-`FileAccessed`, `FileDownloaded`, `FileUploaded`, `FileDeleted`, `FileRenamed`, `FileMoved`,
-`SharingInvitationCreated`, `SharingSet`, `PermissionLevelAdded`, `SitePermissionsModified`,
-`ListCreated`, `ListDeleted`, `PageViewed`, `SearchQueryPerformed`
+**Covered operations:**
+
+| Category | Example Operations |
+|---|---|
+| File operations | `FileAccessed`, `FileDownloaded`, `FileUploaded`, `FileDeleted`, `FileRenamed`, `FileMoved`, `FileCopied`, `FileCheckedIn`, `FileCheckedOut` |
+| Sharing | `SharingInvitationCreated`, `SharingSet`, `AnonymousLinkCreated`, `SharingRevoked` |
+| Permissions | `PermissionLevelAdded`, `PermissionLevelRemoved`, `SitePermissionsModified` |
+| Lists & items | `ListCreated`, `ListDeleted`, `ListItemCreated`, `ListItemUpdated`, `ListItemDeleted` |
+| Content types | `ContentTypeAdded`, `ContentTypeModified`, `ContentTypeDeleted` |
+| Fields (columns) | `ColumnCreated`, `ColumnModified`, `ColumnDeleted` |
+| Comments | `CommentCreated`, `CommentDeleted` |
+| Pages & search | `PageViewed`, `SearchQueryPerformed` |
 
 Enter the site URL in the format:
 `https://contoso.sharepoint.com/sites/SiteName`
@@ -257,17 +291,33 @@ Enter the site URL in the format:
 Search by **user UPN** to retrieve all OneDrive activity for that user, or by **drive URL** (the personal SharePoint URL):
 `https://contoso-my.sharepoint.com/personal/firstname_lastname_contoso_com`
 
-Common operations: `FileAccessed`, `FileUploaded`, `FileDownloaded`, `FileDeleted`, `FileSyncUploadedFull`, `FileSyncDownloadedFull`
+OneDrive is covered by the `oneDrive` record type. Additionally, `sharePointFileOperation` (included in the SharePoint filter) also covers OneDrive file operations, providing overlapping coverage.
+
+Common operations: `FileAccessed`, `FileUploaded`, `FileDownloaded`, `FileDeleted`, `FileRenamed`, `FileSyncUploadedFull`, `FileSyncDownloadedFull`, `FileMalwareDetected`
 
 ---
 
 ### Microsoft Teams — by Team Name
 
-Performs a keyword search across Teams audit records. Common operations include:
+Performs a keyword search across Teams audit records across three record types:
+`microsoftTeams`, `microsoftTeamsAdmin`, `microsoftTeamsDevice`
 
-`TeamCreated`, `TeamDeleted`, `ChannelCreated`, `ChannelDeleted`,
-`MemberAdded`, `MemberRemoved`, `MemberRoleChanged`,
-`AppInstalled`, `TabCreated`, `ChatMessageSent`
+**Covered operations:**
+
+| Category | Example Operations |
+|---|---|
+| Teams & channels | `TeamCreated`, `TeamDeleted`, `TeamUpdated`, `ChannelCreated`, `ChannelDeleted` |
+| Members | `MemberAdded`, `MemberRemoved`, `MemberRoleChanged` |
+| Meetings | `MeetingCreated`, `MeetingDeleted`, `MeetingParticipantDetail` |
+| Apps & tabs | `AppInstalled`, `AppUninstalled`, `TabCreated`, `TabUpdated`, `TabDeleted` |
+| Admin policies | `PolicyAssigned`, `TeamsTenantSettingChanged` (via `microsoftTeamsAdmin`) |
+| Devices | `DeviceConfigurationChanged`, `DeviceUpdated` (via `microsoftTeamsDevice`) |
+
+> **Not covered — requires additional app deployment:**
+> - **Teams Shifts** activities → record type `microsoftTeamsShifts` (requires Shifts app)
+> - **Teams Approvals** activities → record type `teamsEasyApprovalsAuditRecord` (requires Approvals app)
+>
+> Uncomment the relevant lines in `$TeamsRecordTypes` in the script if your organisation uses these apps.
 
 > **Note:** Team name search uses keyword matching and may return records from similarly named teams. Review the `TeamName` column to confirm relevance.
 
@@ -296,7 +346,7 @@ Each search produces output files in two subfolders next to the script:
 
 **Exchange Online**
 
-`DateTime`, `Service`, `RecordType`, `Operation`, `LogonType`, `UserId`, `MailboxOwnerUPN`, `ClientIP`, `ClientInfo`, `ExternalAccess`, `FolderPath`, `ItemSubject`, `AffectedItems`, `ResultStatus`, `ObjectId`
+`DateTime`, `Service`, `RecordType`, `Operation`, `LogonType`, `UserId`, `MailboxOwnerUPN`, `ClientIP`, `ClientInfo`, `ExternalAccess`, `FolderPath`, `ItemSubject`, `AffectedItemsCount`, `AffectedItemsSubjects`, `AffectedItemsFolders`, `ResultStatus`, `ObjectId`
 
 **SharePoint**
 

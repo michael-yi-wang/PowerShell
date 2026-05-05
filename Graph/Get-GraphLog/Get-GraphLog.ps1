@@ -48,7 +48,8 @@
 
 .NOTES
     Required Azure AD Application Permissions (app-only):
-      - AuditLog.Read.All
+      - AuditLogsQuery.Read.All   (required for /beta/security/auditLog/queries)
+      - AuditLog.Read.All         (optional — covers AAD sign-in and directory audit logs)
 
     Authentication:
       App-only certificate authentication (X.509).
@@ -108,27 +109,34 @@ $OutputDir  = Join-Path $ScriptRoot 'outputs'
 # ─── Audit Record Type Constants ─────────────────────────────────────────────
 
 $ExchangeRecordTypes = @(
-    'exchangeItem',
-    'exchangeItemGroup',
-    'exchangeAdmin',
-    'exchangeSearch'
+    'exchangeItem',           # individual item operations (Move, Delete, SendAs, FolderBind, etc.)
+    'exchangeItemGroup',      # bulk operations on multiple items
+    'exchangeItemAggregated', # aggregated access events incl. MailItemsAccessed (requires E5/Purview Premium)
+    'exchangeAdmin',          # admin cmdlet operations (Set-Mailbox, Set-CASMailbox, etc.)
+    'exchangeSearch'          # mailbox search query events
 )
 
 $SharePointRecordTypes = @(
-    'sharePoint',
-    'sharePointFileOperation',
-    'sharePointListItemOperation',
-    'sharePointSharingOperation',
-    'sharePointCommentOperation',
-    'sharePointListOperation',
-    'sharePointSearch'
+    'sharePoint',                       # general site/web events
+    'sharePointFileOperation',          # file upload, download, view, edit, delete, move, copy (also covers OneDrive files)
+    'sharePointListItemOperation',      # list item CRUD
+    'sharePointSharingOperation',       # sharing link and permission events
+    'sharePointCommentOperation',       # comment add/delete
+    'sharePointListOperation',          # list create/delete/settings changes
+    'sharePointContentTypeOperation',   # content type create/modify/delete
+    'sharePointFieldOperation',         # column (field) create/modify/delete
+    'sharePointSearch'                  # search query events
 )
 
 $OneDriveRecordTypes = @('oneDrive')
 
 $TeamsRecordTypes = @(
-    'microsoftTeams',
-    'microsoftTeamsAdmin'
+    'microsoftTeams',       # chat, channel, meeting, member, app, and tab events
+    'microsoftTeamsAdmin',  # tenant-level admin policy and settings changes
+    'microsoftTeamsDevice'  # Teams-certified device management events
+    # Note: Teams Shifts → 'microsoftTeamsShifts' (requires Shifts app deployment)
+    # Note: Teams Approvals → 'teamsEasyApprovalsAuditRecord' (requires Approvals app deployment)
+    # Add the above lines (uncommented) if your organisation uses those apps
 )
 
 # Exchange mailbox logon type mapping (value in AuditData.LogonType)
@@ -387,7 +395,8 @@ function Get-AuditLogRecords {
             Write-Log "  Page $PageIndex : $($Response.value.Count) records (running total: $($Records.Count))"
         }
 
-        $Uri = $Response.'@odata.nextLink'
+        # Bracket notation returns $null safely when the key is absent (dot notation throws under StrictMode)
+        $Uri = $Response['@odata.nextLink']
 
         if ($null -ne $Uri) {
             Write-Log "WARNING: Result set has more than $($Records.Count) records. Fetching next page..." -Level Warning
@@ -476,6 +485,82 @@ function Get-RecordField {
     return Get-SafeValue -Data $Record -Key $Key -Default $Default
 }
 
+function Get-RawValue {
+    # Returns the raw object value (no string conversion) from a hashtable/PSObject.
+    param ([object]$Data, [string]$Key)
+    if ($null -eq $Data) { return $null }
+    if ($Data -is [System.Collections.IDictionary]) {
+        foreach ($k in $Data.Keys) {
+            if ($k -ieq $Key) { return $Data[$k] }
+        }
+        return $null
+    }
+    $prop = $Data.PSObject.Properties | Where-Object { $_.Name -ieq $Key } | Select-Object -First 1
+    return if ($null -ne $prop) { $prop.Value } else { $null }
+}
+
+function Get-OperationName {
+    # Resolves the operation name, checking top-level fields then auditData.Operation as fallback.
+    # Some record types return an empty operationName and store the value only inside auditData.
+    param ([object]$Record, [object]$AuditData)
+    foreach ($key in @('operationName', 'operation')) {
+        $op = Get-RecordField -Record $Record -Key $key
+        if (-not [string]::IsNullOrWhiteSpace($op)) { return $op }
+    }
+    if ($null -ne $AuditData) {
+        $op = Get-SafeValue -Data $AuditData -Key 'Operation'
+        if (-not [string]::IsNullOrWhiteSpace($op)) { return $op }
+    }
+    return ''
+}
+
+function Expand-AffectedItems {
+    # Expands the Exchange AffectedItems array into Count, Subjects, and Folders strings.
+    param ([object]$Items)
+    $empty = @{ Count = ''; Subjects = ''; Folders = '' }
+    if ($null -eq $Items) { return $empty }
+
+    if ($Items -is [string]) {
+        if ([string]::IsNullOrWhiteSpace($Items)) { return $empty }
+        try   { $Items = $Items | ConvertFrom-Json }
+        catch { return @{ Count = '1'; Subjects = $Items; Folders = '' } }
+    }
+
+    $itemList = @($Items)
+    $subjects = $itemList | ForEach-Object { Get-SafeValue -Data $_ -Key 'Subject' }
+    $folders  = $itemList | ForEach-Object {
+        $pf = Get-RawValue -Data $_ -Key 'ParentFolder'
+        if ($null -ne $pf) { Get-SafeValue -Data $pf -Key 'FolderPathName' } else { '' }
+    }
+
+    return @{
+        Count    = [string]$itemList.Count
+        Subjects = ($subjects | Where-Object { $_ }) -join '; '
+        Folders  = ($folders  | Where-Object { $_ }) -join '; '
+    }
+}
+
+function Expand-Members {
+    # Flattens a Teams Members array into a semicolon-separated list of UPNs or display names.
+    param ([object]$Members)
+    if ($null -eq $Members) { return '' }
+
+    if ($Members -is [string]) {
+        if ([string]::IsNullOrWhiteSpace($Members)) { return '' }
+        try   { $Members = $Members | ConvertFrom-Json }
+        catch { return $Members }
+    }
+
+    $list = @($Members)
+    $names = $list | ForEach-Object {
+        $v = Get-SafeValue -Data $_ -Key 'UPN'
+        if (-not $v) { $v = Get-SafeValue -Data $_ -Key 'DisplayName' }
+        if (-not $v) { $v = Get-SafeValue -Data $_ -Key 'Email' }
+        $v
+    }
+    return ($names | Where-Object { $_ }) -join '; '
+}
+
 # endregion
 
 
@@ -505,22 +590,26 @@ function Format-ExchangeRecord {
         }
     }
 
+    $AI = Expand-AffectedItems -Items (Get-RawValue -Data $AD -Key 'AffectedItems')
+
     [PSCustomObject]@{
-        DateTime        = Get-RecordField -Record $Record -Key 'createdDateTime'
-        Service         = 'Exchange Online'
-        RecordType      = Get-RecordField -Record $Record -Key 'auditLogRecordType'
-        Operation       = Get-RecordField -Record $Record -Key 'operationName'
-        LogonType       = $LogonType
-        UserId          = Get-RecordField -Record $Record -Key 'userId'
-        MailboxOwnerUPN = Get-SafeValue   -Data $AD       -Key 'MailboxOwnerUPN'
-        ClientIP        = Get-RecordField -Record $Record -Key 'clientIp'
-        ClientInfo      = Get-SafeValue   -Data $AD       -Key 'ClientInfoString'
-        ExternalAccess  = Get-SafeValue   -Data $AD       -Key 'ExternalAccess'
-        FolderPath      = Get-SafeValue   -Data $AD       -Key 'FolderPathName'
-        ItemSubject     = Get-SafeValue   -Data $AD       -Key 'ItemSubject'
-        AffectedItems   = Get-SafeValue   -Data $AD       -Key 'AffectedItems'
-        ResultStatus    = Get-SafeValue   -Data $AD       -Key 'ResultStatus'
-        ObjectId        = Get-RecordField -Record $Record -Key 'objectId'
+        DateTime              = Get-RecordField -Record $Record -Key 'createdDateTime'
+        Service               = 'Exchange Online'
+        RecordType            = Get-RecordField -Record $Record -Key 'auditLogRecordType'
+        Operation             = Get-OperationName -Record $Record -AuditData $AD
+        LogonType             = $LogonType
+        UserId                = Get-RecordField -Record $Record -Key 'userId'
+        MailboxOwnerUPN       = Get-SafeValue   -Data $AD       -Key 'MailboxOwnerUPN'
+        ClientIP              = Get-RecordField -Record $Record -Key 'clientIp'
+        ClientInfo            = Get-SafeValue   -Data $AD       -Key 'ClientInfoString'
+        ExternalAccess        = Get-SafeValue   -Data $AD       -Key 'ExternalAccess'
+        FolderPath            = Get-SafeValue   -Data $AD       -Key 'FolderPathName'
+        ItemSubject           = Get-SafeValue   -Data $AD       -Key 'ItemSubject'
+        AffectedItemsCount    = $AI.Count
+        AffectedItemsSubjects = $AI.Subjects
+        AffectedItemsFolders  = $AI.Folders
+        ResultStatus          = Get-SafeValue   -Data $AD       -Key 'ResultStatus'
+        ObjectId              = Get-RecordField -Record $Record -Key 'objectId'
     }
 }
 
@@ -533,7 +622,7 @@ function Format-SharePointRecord {
         DateTime    = Get-RecordField -Record $Record -Key 'createdDateTime'
         Service     = 'SharePoint'
         RecordType  = Get-RecordField -Record $Record -Key 'auditLogRecordType'
-        Operation   = Get-RecordField -Record $Record -Key 'operationName'
+        Operation   = Get-OperationName -Record $Record -AuditData $AD
         UserId      = Get-RecordField -Record $Record -Key 'userId'
         SiteUrl     = Get-SafeValue   -Data $AD       -Key 'SiteUrl'
         WebUrl      = Get-SafeValue   -Data $AD       -Key 'WebUrl'
@@ -556,7 +645,7 @@ function Format-OneDriveRecord {
         DateTime      = Get-RecordField -Record $Record -Key 'createdDateTime'
         Service       = 'OneDrive'
         RecordType    = Get-RecordField -Record $Record -Key 'auditLogRecordType'
-        Operation     = Get-RecordField -Record $Record -Key 'operationName'
+        Operation     = Get-OperationName -Record $Record -AuditData $AD
         UserId        = Get-RecordField -Record $Record -Key 'userId'
         SiteUrl       = Get-SafeValue   -Data $AD       -Key 'SiteUrl'
         FileName      = Get-SafeValue   -Data $AD       -Key 'SourceFileName'
@@ -577,12 +666,12 @@ function Format-TeamsRecord {
         DateTime          = Get-RecordField -Record $Record -Key 'createdDateTime'
         Service           = 'Microsoft Teams'
         RecordType        = Get-RecordField -Record $Record -Key 'auditLogRecordType'
-        Operation         = Get-RecordField -Record $Record -Key 'operationName'
+        Operation         = Get-OperationName -Record $Record -AuditData $AD
         UserId            = Get-RecordField -Record $Record -Key 'userId'
         TeamName          = Get-SafeValue   -Data $AD       -Key 'TeamName'
         ChannelName       = Get-SafeValue   -Data $AD       -Key 'ChannelName'
         CommunicationType = Get-SafeValue   -Data $AD       -Key 'CommunicationType'
-        Members           = Get-SafeValue   -Data $AD       -Key 'Members'
+        Members           = Expand-Members  -Members (Get-RawValue -Data $AD -Key 'Members')
         TabName           = Get-SafeValue   -Data $AD       -Key 'TabName'
         ClientIP          = Get-RecordField -Record $Record -Key 'clientIp'
         ObjectId          = Get-RecordField -Record $Record -Key 'objectId'
@@ -641,6 +730,8 @@ function Invoke-ExchangeAuditSearch {
 
     Write-Log "Exchange audit search — UPN: $Upn"
     Write-Log "NOTE: Includes owner, delegate, and admin access. Check the 'LogonType' column to differentiate." -Level Warning
+    Write-Log "NOTE: 'Move' and 'MoveToDeletedItems' operations are NOT audited by default. Enable them per mailbox: Set-Mailbox -Identity <UPN> -AuditOwner @{Add='Move','MoveToDeletedItems'} -AuditDelegate @{Add='Move','MoveToDeletedItems'}" -Level Warning
+    Write-Log "NOTE: 'MailItemsAccessed' events require Microsoft 365 E5 or Purview Audit Premium licence." -Level Warning
 
     $QueryBody = @{
         displayName              = "Exchange-$Upn-$RunStamp"
