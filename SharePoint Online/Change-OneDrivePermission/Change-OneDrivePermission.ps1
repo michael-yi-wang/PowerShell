@@ -2,12 +2,20 @@
 
 <#
 .SYNOPSIS
-    Grants Owner and/or Site Collection Admin permissions on a OneDrive for Business site.
+    Inspects and modifies Owner and Site Collection Admin permissions on a OneDrive for Business site.
 
 .DESCRIPTION
     Connects to a OneDrive for Business (personal site) using PnP.PowerShell with
-    certificate-based app-only authentication. Provides an interactive menu to grant
-    a specified user Owner and/or Site Collection Admin rights on a given OneDrive URL.
+    certificate-based app-only authentication. Provides an interactive menu with two
+    phases of operation:
+
+    Phase 1 — Inspection (OneDrive URL only):
+        Once a OneDrive URL is provided, the script can connect and display the current
+        primary owner and all site collection admins without requiring a user UPN.
+
+    Phase 2 — Permission Grant (OneDrive URL + User UPN):
+        When a User UPN is also supplied, additional options become available to grant
+        Owner, Site Collection Admin, or both permissions to that user.
 
     Supports both active OneDrive profiles and profiles of deleted users that are
     retained by a retention policy ("Profile Missing" state in the SharePoint Admin
@@ -48,7 +56,7 @@
 
 .NOTES
     Author   : Michael Wang
-    Version  : 1.0.0
+    Version  : 1.3.0
     Requires : PowerShell 7.0+, PnP.PowerShell module
 
     The Entra ID app registration must hold the SharePoint application permission:
@@ -145,6 +153,18 @@ function Test-OneDriveUrl {
     return $trimmed -match '^https://[a-zA-Z0-9][a-zA-Z0-9-]*-my\.sharepoint\.com/personal/[^/]+$'
 }
 
+function Get-AdminCenterUrl {
+    # Derives the SPO admin centre URL from a OneDrive personal site URL.
+    # e.g. https://contoso-my.sharepoint.com/personal/... → https://contoso-admin.sharepoint.com
+    [OutputType([string])]
+    param ([string]$OneDriveUrl)
+
+    if ($OneDriveUrl -match '^(https://[a-zA-Z0-9][a-zA-Z0-9-]*)-my\.sharepoint\.com') {
+        return "$($Matches[1])-admin.sharepoint.com"
+    }
+    return $null
+}
+
 function Resolve-AppConfig {
     # Returns a hashtable with AppId, Thumbprint, and TenantId.
     [OutputType([hashtable])]
@@ -209,6 +229,29 @@ function Connect-ToOneDriveSite {
     }
 }
 
+function Connect-ToAdminCenter {
+    [OutputType([bool])]
+    param (
+        [string]$AdminUrl,
+        [hashtable]$Config
+    )
+
+    try {
+        Write-Log -Message "Connecting to admin centre: $AdminUrl"
+        Connect-PnPOnline -Url        $AdminUrl `
+                          -ClientId   $Config.AppId `
+                          -Thumbprint $Config.Thumbprint `
+                          -Tenant     $Config.TenantId `
+                          -ErrorAction Stop
+        Write-Log -Message 'Admin centre connection established.'
+        return $true
+    }
+    catch {
+        Write-Log -Message "Admin centre connection failed: $($_.Exception.Message)" -Level Error
+        return $false
+    }
+}
+
 function Get-CurrentSiteAdmins {
     # Returns existing site collection admin objects, or an empty array on failure.
     [OutputType([object[]])]
@@ -224,8 +267,24 @@ function Get-CurrentSiteAdmins {
     }
 }
 
+function Get-OneDriveSiteOwner {
+    # Returns the primary site owner user object, or $null on failure.
+    [OutputType([object])]
+    param ()
+
+    try {
+        $site = Get-PnPSite -Includes Owner -ErrorAction Stop
+        return $site.Owner
+    }
+    catch {
+        Write-Log -Message "Unable to retrieve site owner: $($_.Exception.Message)" -Level Warning
+        return $null
+    }
+}
+
 function Grant-OneDriveOwner {
-    # Sets the primary owner of the OneDrive site. Replaces any existing owner.
+    # Sets the primary owner via the admin centre. Replaces any existing owner.
+    # Requires an active admin centre connection (Connect-ToAdminCenter).
     [OutputType([bool])]
     param (
         [string]$UserUPN,
@@ -234,18 +293,32 @@ function Grant-OneDriveOwner {
 
     try {
         Write-Log -Message "Setting '$UserUPN' as owner of '$SiteUrl'."
-        Set-PnPSite -Owner $UserUPN -ErrorAction Stop
-        Write-Log -Message "Owner updated successfully."
+        Set-PnPTenantSite -Url $SiteUrl -Owner $UserUPN -ErrorAction Stop
+        Write-Log -Message 'Owner updated successfully.'
         return $true
     }
     catch {
-        Write-Log -Message "Failed to set owner '$UserUPN': $($_.Exception.Message)" -Level Error
+        $msg = $_.Exception.Message
+        Write-Log -Message "Failed to set owner '$UserUPN': $msg" -Level Error
+
+        if ($msg -match 'Forbidden') {
+            Write-Host ''
+            Write-Host '  Possible causes for the Forbidden error:' -ForegroundColor Yellow
+            Write-Host '    1. The UPN is a deleted/departed account — SharePoint cannot assign a' -ForegroundColor Yellow
+            Write-Host '       deleted user as primary owner. Use an active admin UPN instead.' -ForegroundColor Yellow
+            Write-Host '    2. The Entra ID app registration does not hold the SharePoint' -ForegroundColor Yellow
+            Write-Host '       Administrator role. Assign it in Entra ID → Enterprise Applications.' -ForegroundColor Yellow
+            Write-Host '  For departed-user OneDrive sites, use Site Collection Admin (option 2)' -ForegroundColor Yellow
+            Write-Host '  to grant access without changing primary ownership.' -ForegroundColor Yellow
+        }
+
         return $false
     }
 }
 
 function Grant-OneDriveSiteAdmin {
-    # Adds the user as a site collection admin. Existing admins are preserved.
+    # Adds the user as a site collection admin via the admin centre. Existing admins are preserved.
+    # Requires an active admin centre connection (Connect-ToAdminCenter).
     [OutputType([bool])]
     param (
         [string]$UserUPN,
@@ -254,12 +327,128 @@ function Grant-OneDriveSiteAdmin {
 
     try {
         Write-Log -Message "Adding '$UserUPN' as site collection admin of '$SiteUrl'."
-        Add-PnPSiteCollectionAdmin -Owners @($UserUPN) -ErrorAction Stop
-        Write-Log -Message "Site collection admin added successfully."
+        Set-PnPTenantSite -Url $SiteUrl -Owners @($UserUPN) -ErrorAction Stop
+        Write-Log -Message 'Site collection admin added successfully.'
         return $true
     }
     catch {
-        Write-Log -Message "Failed to add site collection admin '$UserUPN': $($_.Exception.Message)" -Level Error
+        $msg = $_.Exception.Message
+        Write-Log -Message "Failed to add site collection admin '$UserUPN': $msg" -Level Error
+
+        if ($msg -match 'Forbidden') {
+            Write-Host ''
+            Write-Host '  Possible causes for the Forbidden error:' -ForegroundColor Yellow
+            Write-Host '    1. The OneDrive site is still locked (ReadOnly/NoAccess) after account restore.' -ForegroundColor Yellow
+            Write-Host '    2. The Entra ID app lacks the SharePoint Administrator role in Entra ID.' -ForegroundColor Yellow
+        }
+
+        return $false
+    }
+}
+
+#endregion
+
+#region Site Info Check
+
+function Show-OneDriveSiteInfo {
+    param (
+        [string]   $OneDriveUrl,
+        [hashtable]$Config
+    )
+
+    Write-Log -Message "Checking site info for: $OneDriveUrl"
+
+    $connected = Connect-ToOneDriveSite -SiteUrl $OneDriveUrl -Config $Config
+    if (-not $connected) {
+        Write-Host ''
+        Write-Host '  Unable to connect to the OneDrive site. Check the log for details.' -ForegroundColor Red
+        Read-Host "`n  Press Enter to return to the menu"
+        return
+    }
+
+    try {
+        $owner  = Get-OneDriveSiteOwner
+        $admins = @(Get-CurrentSiteAdmins)
+
+        Write-Host ''
+        Write-Host '  +--------------------------------------------------+' -ForegroundColor Cyan
+        Write-Host '  |  Site Information                                |' -ForegroundColor Cyan
+        Write-Host '  +--------------------------------------------------+' -ForegroundColor Cyan
+        Write-Host "  |  OneDrive : $OneDriveUrl" -ForegroundColor White
+        Write-Host '  |' -ForegroundColor Cyan
+        Write-Host '  |  Primary Owner:' -ForegroundColor Cyan
+
+        if ($null -ne $owner) {
+            $ownerDisplay = if (-not [string]::IsNullOrEmpty($owner.Email)) {
+                "$($owner.Title) ($($owner.Email))"
+            }
+            else {
+                $owner.LoginName
+            }
+            Write-Host "  |    $ownerDisplay" -ForegroundColor White
+        }
+        else {
+            Write-Host '  |    (unable to retrieve)' -ForegroundColor DarkGray
+        }
+
+        Write-Host '  |' -ForegroundColor Cyan
+        Write-Host '  |  Site Collection Admins:' -ForegroundColor Cyan
+
+        if ($admins.Count -gt 0) {
+            foreach ($admin in $admins) {
+                $display = if (-not [string]::IsNullOrEmpty($admin.Email)) {
+                    "$($admin.Title) ($($admin.Email))"
+                }
+                else {
+                    $admin.LoginName
+                }
+                Write-Host "  |    - $display" -ForegroundColor White
+            }
+        }
+        else {
+            Write-Host '  |    (none found)' -ForegroundColor DarkGray
+        }
+
+        Write-Host '  +--------------------------------------------------+' -ForegroundColor Cyan
+    }
+    finally {
+        try { Disconnect-PnPOnline -ErrorAction SilentlyContinue } catch {}
+    }
+
+    Read-Host "`n  Press Enter to return to the menu"
+}
+
+function Invoke-SiteUnlockIfNeeded {
+    # Checks the OneDrive site lock state from an active admin centre connection and
+    # unlocks the site if it is in ReadOnly or NoAccess state.
+    # When a user account is deleted, SharePoint locks the OneDrive; re-enabling the
+    # account does not automatically unlock it — write operations fail with Forbidden
+    # until the site is explicitly set back to Unlock.
+    [OutputType([bool])]
+    param ([string]$SiteUrl)
+
+    try {
+        $site      = Get-PnPTenantSite -Url $SiteUrl -ErrorAction Stop
+        $lockState = $site.LockState.ToString()
+        Write-Log -Message "Site lock state: $lockState"
+
+        if ($lockState -eq 'Unlock') {
+            return $true
+        }
+
+        Write-Log -Message "Site is locked ($lockState) — attempting to unlock." -Level Warning
+        Set-PnPTenantSite -Url $SiteUrl -LockState Unlock -ErrorAction Stop
+        Write-Log -Message 'Site unlocked successfully.'
+        return $true
+    }
+    catch {
+        Write-Log -Message "Unable to verify/unlock site state: $($_.Exception.Message)" -Level Warning
+        Write-Host ''
+        Write-Host '  Warning: Could not verify site lock state. If the grant fails with Forbidden:' -ForegroundColor Yellow
+        Write-Host '    1. The OneDrive may still be locked (ReadOnly/NoAccess) after account restore.' -ForegroundColor Yellow
+        Write-Host '       Unlock it manually: SharePoint Admin Centre → Active Sites → select site → Policies.' -ForegroundColor Yellow
+        Write-Host '    2. The Entra ID app may lack the SharePoint Administrator role.' -ForegroundColor Yellow
+        Write-Host '       Assign it in Entra ID → Enterprise Applications → [app] → Roles and administrators.' -ForegroundColor Yellow
         return $false
     }
 }
@@ -278,6 +467,7 @@ function Invoke-GrantPermission {
 
     Write-Log -Message "Starting permission grant — UPN: '$UserUPN', URL: '$OneDriveUrl', Type: '$PermissionType'."
 
+    #--- Phase 1: connect to the OneDrive site to read current state ---
     $connected = Connect-ToOneDriveSite -SiteUrl $OneDriveUrl -Config $Config
     if (-not $connected) {
         Write-Host ''
@@ -287,15 +477,15 @@ function Invoke-GrantPermission {
     }
 
     try {
-        # Show existing site collection admins before making changes
-        $existingAdmins = Get-CurrentSiteAdmins
+        $existingAdmins = @(Get-CurrentSiteAdmins)
         Write-Host ''
         Write-Host '  Current Site Collection Admins:' -ForegroundColor Cyan
         if ($existingAdmins.Count -gt 0) {
             foreach ($admin in $existingAdmins) {
                 $display = if (-not [string]::IsNullOrEmpty($admin.Email)) {
                     "$($admin.Title) ($($admin.Email))"
-                } else {
+                }
+                else {
                     $admin.LoginName
                 }
                 Write-Host "    - $display" -ForegroundColor White
@@ -304,26 +494,52 @@ function Invoke-GrantPermission {
         else {
             Write-Host '    (none found)' -ForegroundColor DarkGray
         }
+    }
+    finally {
+        try { Disconnect-PnPOnline -ErrorAction SilentlyContinue } catch {}
+    }
 
-        # Summarise pending action and ask for confirmation
+    # Summarise pending action and ask for confirmation before connecting to admin centre
+    Write-Host ''
+    Write-Host '  Pending Action:' -ForegroundColor Cyan
+    Write-Host "    OneDrive   : $OneDriveUrl" -ForegroundColor White
+    Write-Host "    User       : $UserUPN" -ForegroundColor White
+    Write-Host "    Permission : $PermissionType" -ForegroundColor White
+    Write-Host ''
+
+    if ($PermissionType -in @('Owner', 'Both')) {
+        Write-Host '  NOTE: Setting a new owner will replace the current primary owner.' -ForegroundColor Yellow
+    }
+
+    $confirm = Read-Host '  Proceed? (Y/N)'
+    if ($confirm.Trim().ToUpper() -ne 'Y') {
+        Write-Log -Message 'Permission grant cancelled by operator.' -Level Warning
+        Write-Host "`n  Operation cancelled." -ForegroundColor Yellow
+        Read-Host "`n  Press Enter to return to the menu"
+        return
+    }
+
+    #--- Phase 2: connect to the admin centre to perform grant operations ---
+    $adminUrl = Get-AdminCenterUrl -OneDriveUrl $OneDriveUrl
+    if (-not $adminUrl) {
+        Write-Log -Message "Could not derive admin centre URL from: $OneDriveUrl" -Level Error
+        Write-Host '  Unable to determine the SharePoint admin centre URL.' -ForegroundColor Red
+        Read-Host "`n  Press Enter to return to the menu"
+        return
+    }
+
+    $adminConnected = Connect-ToAdminCenter -AdminUrl $adminUrl -Config $Config
+    if (-not $adminConnected) {
         Write-Host ''
-        Write-Host '  Pending Action:' -ForegroundColor Cyan
-        Write-Host "    OneDrive   : $OneDriveUrl" -ForegroundColor White
-        Write-Host "    User       : $UserUPN" -ForegroundColor White
-        Write-Host "    Permission : $PermissionType" -ForegroundColor White
-        Write-Host ''
+        Write-Host '  Unable to connect to the SharePoint admin centre. Check the log for details.' -ForegroundColor Red
+        Read-Host "`n  Press Enter to return to the menu"
+        return
+    }
 
-        if ($PermissionType -in @('Owner', 'Both')) {
-            Write-Host '  NOTE: Setting a new owner will replace the current primary owner.' -ForegroundColor Yellow
-        }
-
-        $confirm = Read-Host '  Proceed? (Y/N)'
-        if ($confirm.Trim().ToUpper() -ne 'Y') {
-            Write-Log -Message "Permission grant cancelled by operator." -Level Warning
-            Write-Host "`n  Operation cancelled." -ForegroundColor Yellow
-            Read-Host "`n  Press Enter to return to the menu"
-            return
-        }
+    try {
+        # Unlock the site if it was locked when the user account was deleted.
+        # Re-enabling the account does not automatically restore the Unlock state.
+        Invoke-SiteUnlockIfNeeded -SiteUrl $OneDriveUrl | Out-Null
 
         $ownerSuccess = $true
         $adminSuccess = $true
@@ -433,6 +649,9 @@ function Show-MainMenu {
         [string]$UserUPN
     )
 
+    $urlIsSet = -not [string]::IsNullOrEmpty($OneDriveUrl)
+    $upnIsSet = -not [string]::IsNullOrEmpty($UserUPN)
+
     Clear-Host
     Write-Host ''
     Write-Host '  +================================================+' -ForegroundColor Cyan
@@ -442,24 +661,29 @@ function Show-MainMenu {
     Write-Host '  Current Selection:' -ForegroundColor White
 
     Write-Host '    [U] OneDrive URL  :  ' -NoNewline -ForegroundColor White
-    if ([string]::IsNullOrEmpty($OneDriveUrl)) {
-        Write-Host '(not set)' -ForegroundColor DarkGray
+    if ($urlIsSet) {
+        Write-Host $OneDriveUrl -ForegroundColor Yellow
     }
     else {
-        Write-Host $OneDriveUrl -ForegroundColor Yellow
+        Write-Host '(not set)' -ForegroundColor DarkGray
     }
 
     Write-Host '    [P] User UPN      :  ' -NoNewline -ForegroundColor White
-    if ([string]::IsNullOrEmpty($UserUPN)) {
-        Write-Host '(not set)' -ForegroundColor DarkGray
+    if ($upnIsSet) {
+        Write-Host $UserUPN -ForegroundColor Yellow
     }
     else {
-        Write-Host $UserUPN -ForegroundColor Yellow
+        Write-Host '(not set — required to grant permissions)' -ForegroundColor DarkGray
     }
 
     Write-Host ''
     Write-Host '  ------------------------------------------------' -ForegroundColor DarkGray
-    Write-Host '    [G]  Grant Permission' -ForegroundColor White
+
+    $checkColor = if ($urlIsSet) { 'White' } else { 'DarkGray' }
+    $grantColor = if ($urlIsSet -and $upnIsSet) { 'White' } else { 'DarkGray' }
+
+    Write-Host '    [C]  Check Current Owner & Site Collection Admins' -ForegroundColor $checkColor
+    Write-Host '    [G]  Grant Permission' -ForegroundColor $grantColor
     Write-Host '    [Q]  Quit' -ForegroundColor White
     Write-Host '  ------------------------------------------------' -ForegroundColor DarkGray
     Write-Host ''
@@ -517,6 +741,15 @@ function Start-InteractiveMenu {
                 Write-Log -Message "User UPN set to: $currentUPN"
             }
 
+            'C' {
+                if ([string]::IsNullOrEmpty($currentUrl)) {
+                    Write-Host "`n  Please set a OneDrive URL first (press [U])." -ForegroundColor Yellow
+                    Start-Sleep -Seconds 2
+                    break
+                }
+                Show-OneDriveSiteInfo -OneDriveUrl $currentUrl -Config $Config
+            }
+
             'G' {
                 if ([string]::IsNullOrEmpty($currentUrl)) {
                     Write-Host "`n  Please set a OneDrive URL first (press [U])." -ForegroundColor Yellow
@@ -538,7 +771,7 @@ function Start-InteractiveMenu {
             }
 
             default {
-                Write-Host "`n  Invalid option. Press U, P, G, or Q." -ForegroundColor Red
+                Write-Host "`n  Invalid option. Press U, C, P, G, or Q." -ForegroundColor Red
                 Start-Sleep -Seconds 1
             }
         }
