@@ -56,7 +56,7 @@
 
 .NOTES
     Author   : Michael Wang
-    Version  : 1.3.0
+    Version  : 1.4.0
     Requires : PowerShell 7.0+, PnP.PowerShell module
 
     The Entra ID app registration must hold the SharePoint application permission:
@@ -358,6 +358,7 @@ function Show-OneDriveSiteInfo {
 
     Write-Log -Message "Checking site info for: $OneDriveUrl"
 
+    # Phase 1: connect to the OneDrive site to read owner and admins
     $connected = Connect-ToOneDriveSite -SiteUrl $OneDriveUrl -Config $Config
     if (-not $connected) {
         Write-Host ''
@@ -366,54 +367,110 @@ function Show-OneDriveSiteInfo {
         return
     }
 
+    $owner  = $null
+    $admins = @()
     try {
         $owner  = Get-OneDriveSiteOwner
         $admins = @(Get-CurrentSiteAdmins)
-
-        Write-Host ''
-        Write-Host '  +--------------------------------------------------+' -ForegroundColor Cyan
-        Write-Host '  |  Site Information                                |' -ForegroundColor Cyan
-        Write-Host '  +--------------------------------------------------+' -ForegroundColor Cyan
-        Write-Host "  |  OneDrive : $OneDriveUrl" -ForegroundColor White
-        Write-Host '  |' -ForegroundColor Cyan
-        Write-Host '  |  Primary Owner:' -ForegroundColor Cyan
-
-        if ($null -ne $owner) {
-            $ownerDisplay = if (-not [string]::IsNullOrEmpty($owner.Email)) {
-                "$($owner.Title) ($($owner.Email))"
-            }
-            else {
-                $owner.LoginName
-            }
-            Write-Host "  |    $ownerDisplay" -ForegroundColor White
-        }
-        else {
-            Write-Host '  |    (unable to retrieve)' -ForegroundColor DarkGray
-        }
-
-        Write-Host '  |' -ForegroundColor Cyan
-        Write-Host '  |  Site Collection Admins:' -ForegroundColor Cyan
-
-        if ($admins.Count -gt 0) {
-            foreach ($admin in $admins) {
-                $display = if (-not [string]::IsNullOrEmpty($admin.Email)) {
-                    "$($admin.Title) ($($admin.Email))"
-                }
-                else {
-                    $admin.LoginName
-                }
-                Write-Host "  |    - $display" -ForegroundColor White
-            }
-        }
-        else {
-            Write-Host '  |    (none found)' -ForegroundColor DarkGray
-        }
-
-        Write-Host '  +--------------------------------------------------+' -ForegroundColor Cyan
     }
     finally {
         try { Disconnect-PnPOnline -ErrorAction SilentlyContinue } catch {}
     }
+
+    # Phase 2: connect to the admin centre to read site status (LockState, ArchiveStatus)
+    $lockState     = $null
+    $archiveStatus = $null
+
+    $adminUrl = Get-AdminCenterUrl -OneDriveUrl $OneDriveUrl
+    if ($adminUrl) {
+        $adminConnected = Connect-ToAdminCenter -AdminUrl $adminUrl -Config $Config
+        if ($adminConnected) {
+            try {
+                $tenantSite    = Get-PnPTenantSite -Url $OneDriveUrl -ErrorAction Stop
+                $lockState     = $tenantSite.LockState.ToString()
+                $archiveStatus = $tenantSite.ArchiveStatus.ToString()
+            }
+            catch {
+                Write-Log -Message "Unable to retrieve tenant site status: $($_.Exception.Message)" -Level Warning
+            }
+            finally {
+                try { Disconnect-PnPOnline -ErrorAction SilentlyContinue } catch {}
+            }
+        }
+    }
+
+    Write-Host ''
+    Write-Host '  +--------------------------------------------------+' -ForegroundColor Cyan
+    Write-Host '  |  Site Information                                |' -ForegroundColor Cyan
+    Write-Host '  +--------------------------------------------------+' -ForegroundColor Cyan
+    Write-Host "  |  OneDrive : $OneDriveUrl" -ForegroundColor White
+    Write-Host '  |' -ForegroundColor Cyan
+    Write-Host '  |  Site Status:' -ForegroundColor Cyan
+
+    $lockColor = switch ($lockState) {
+        'Unlock'   { 'Green'  }
+        'ReadOnly' { 'Yellow' }
+        'NoAccess' { 'Red'    }
+        default    { 'DarkGray' }
+    }
+    Write-Host '  |    Lock State     : ' -NoNewline -ForegroundColor Cyan
+    if ($null -ne $lockState) {
+        Write-Host $lockState -ForegroundColor $lockColor
+    }
+    else {
+        Write-Host '(unable to retrieve)' -ForegroundColor DarkGray
+    }
+
+    $archiveColor = switch ($archiveStatus) {
+        'NotArchived'   { 'Green'  }
+        'FullyArchived' { 'Red'    }
+        'Archived'      { 'Yellow' }
+        'Reactivating'  { 'Yellow' }
+        default         { 'White'  }
+    }
+    Write-Host '  |    Archive Status : ' -NoNewline -ForegroundColor Cyan
+    if ($null -ne $archiveStatus) {
+        Write-Host $archiveStatus -ForegroundColor $archiveColor
+    }
+    else {
+        Write-Host '(unable to retrieve)' -ForegroundColor DarkGray
+    }
+
+    Write-Host '  |' -ForegroundColor Cyan
+    Write-Host '  |  Primary Owner:' -ForegroundColor Cyan
+
+    if ($null -ne $owner) {
+        $ownerDisplay = if (-not [string]::IsNullOrEmpty($owner.Email)) {
+            "$($owner.Title) ($($owner.Email))"
+        }
+        else {
+            $owner.LoginName
+        }
+        Write-Host "  |    $ownerDisplay" -ForegroundColor White
+    }
+    else {
+        Write-Host '  |    (unable to retrieve)' -ForegroundColor DarkGray
+    }
+
+    Write-Host '  |' -ForegroundColor Cyan
+    Write-Host '  |  Site Collection Admins:' -ForegroundColor Cyan
+
+    if ($admins.Count -gt 0) {
+        foreach ($admin in $admins) {
+            $display = if (-not [string]::IsNullOrEmpty($admin.Email)) {
+                "$($admin.Title) ($($admin.Email))"
+            }
+            else {
+                $admin.LoginName
+            }
+            Write-Host "  |    - $display" -ForegroundColor White
+        }
+    }
+    else {
+        Write-Host '  |    (none found)' -ForegroundColor DarkGray
+    }
+
+    Write-Host '  +--------------------------------------------------+' -ForegroundColor Cyan
 
     Read-Host "`n  Press Enter to return to the menu"
 }
@@ -537,6 +594,22 @@ function Invoke-GrantPermission {
     }
 
     try {
+        # Archived sites return Forbidden on all read/write operations — block early.
+        $tenantSite    = Get-PnPTenantSite -Url $OneDriveUrl -ErrorAction Stop
+        $archiveStatus = $tenantSite.ArchiveStatus.ToString()
+        if ($archiveStatus -eq 'FullyArchived') {
+            Write-Log -Message "Site is fully archived — permission grant blocked." -Level Error
+            Write-Host ''
+            Write-Host '  ERROR: This OneDrive site is fully archived.' -ForegroundColor Red
+            Write-Host '  Archived sites reject all permission changes.' -ForegroundColor Yellow
+            Write-Host ''
+            Write-Host '  Reactivate the site first, then retry:' -ForegroundColor Yellow
+            Write-Host '    SharePoint Admin Centre → Sites → Archived sites' -ForegroundColor DarkGray
+            Write-Host '    → select site → Reactivate' -ForegroundColor DarkGray
+            Read-Host "`n  Press Enter to return to the menu"
+            return
+        }
+
         # Unlock the site if it was locked when the user account was deleted.
         # Re-enabling the account does not automatically restore the Unlock state.
         Invoke-SiteUnlockIfNeeded -SiteUrl $OneDriveUrl | Out-Null
@@ -682,7 +755,7 @@ function Show-MainMenu {
     $checkColor = if ($urlIsSet) { 'White' } else { 'DarkGray' }
     $grantColor = if ($urlIsSet -and $upnIsSet) { 'White' } else { 'DarkGray' }
 
-    Write-Host '    [C]  Check Current Owner & Site Collection Admins' -ForegroundColor $checkColor
+    Write-Host '    [C]  Check Site Info  (Owner, Admins, Lock State, Archive Status)' -ForegroundColor $checkColor
     Write-Host '    [G]  Grant Permission' -ForegroundColor $grantColor
     Write-Host '    [Q]  Quit' -ForegroundColor White
     Write-Host '  ------------------------------------------------' -ForegroundColor DarkGray
