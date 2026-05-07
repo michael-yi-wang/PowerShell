@@ -56,7 +56,7 @@
 
 .NOTES
     Author   : Michael Wang
-    Version  : 1.4.0
+    Version  : 1.9.0
     Requires : PowerShell 7.0+, PnP.PowerShell module
 
     The Entra ID app registration must hold the SharePoint application permission:
@@ -267,24 +267,12 @@ function Get-CurrentSiteAdmins {
     }
 }
 
-function Get-OneDriveSiteOwner {
-    # Returns the primary site owner user object, or $null on failure.
-    [OutputType([object])]
-    param ()
-
-    try {
-        $site = Get-PnPSite -Includes Owner -ErrorAction Stop
-        return $site.Owner
-    }
-    catch {
-        Write-Log -Message "Unable to retrieve site owner: $($_.Exception.Message)" -Level Warning
-        return $null
-    }
-}
 
 function Grant-OneDriveOwner {
     # Sets the primary owner via the admin centre. Replaces any existing owner.
     # Requires an active admin centre connection (Connect-ToAdminCenter).
+    # Verifies the change was applied — Set-PnPTenantSite -Owner can silently no-op
+    # for OneDrive sites in 'Profile Missing' state (departed user, retention hold).
     [OutputType([bool])]
     param (
         [string]$UserUPN,
@@ -294,7 +282,27 @@ function Grant-OneDriveOwner {
     try {
         Write-Log -Message "Setting '$UserUPN' as owner of '$SiteUrl'."
         Set-PnPTenantSite -Url $SiteUrl -Owner $UserUPN -ErrorAction Stop
-        Write-Log -Message 'Owner updated successfully.'
+
+        # Verify the change was actually applied — the API can return success without
+        # persisting the change for sites in Profile Missing state.
+        $updated   = Get-PnPTenantSite -Url $SiteUrl -ErrorAction Stop
+        $newOwner  = if     ($updated.Owner -match '\|([^|]+)$') { $Matches[1] }
+                     elseif ($updated.Owner -match '@')          { $updated.Owner }
+                     else                                        { $updated.Owner }
+
+        if (-not [string]::IsNullOrEmpty($newOwner) -and $newOwner.ToLower() -ne $UserUPN.ToLower()) {
+            Write-Log -Message "Owner change was accepted but did not apply — current owner is still '$($updated.OwnerName)'. Site may be in 'Profile Missing' state." -Level Warning
+            Write-Host ''
+            Write-Host '  WARNING: SharePoint accepted the request but the owner was not changed.' -ForegroundColor Yellow
+            Write-Host "  Current primary owner remains: $($updated.OwnerName)" -ForegroundColor Yellow
+            Write-Host ''
+            Write-Host '  This occurs for OneDrive sites in ''Profile Missing'' state (departed user).' -ForegroundColor Yellow
+            Write-Host '  Change the primary owner manually in the SharePoint Admin Centre:' -ForegroundColor Yellow
+            Write-Host '    Active sites → select site → Membership tab → Primary admin' -ForegroundColor DarkGray
+            return $false
+        }
+
+        Write-Log -Message 'Owner updated and verified successfully.'
         return $true
     }
     catch {
@@ -367,19 +375,21 @@ function Show-OneDriveSiteInfo {
         return
     }
 
-    $owner  = $null
     $admins = @()
     try {
-        $owner  = Get-OneDriveSiteOwner
         $admins = @(Get-CurrentSiteAdmins)
     }
     finally {
         try { Disconnect-PnPOnline -ErrorAction SilentlyContinue } catch {}
     }
 
-    # Phase 2: connect to the admin centre to read site status (LockState, ArchiveStatus)
+    # Phase 2: connect to the admin centre to read site status and primary owner.
+    # Primary owner must come from Get-PnPTenantSite — Get-PnPSite.Owner does not
+    # reflect changes made via Set-PnPTenantSite -Owner.
     $lockState     = $null
     $archiveStatus = $null
+    $ownerName     = $null
+    $ownerEmail    = $null
 
     $adminUrl = Get-AdminCenterUrl -OneDriveUrl $OneDriveUrl
     if ($adminUrl) {
@@ -389,6 +399,10 @@ function Show-OneDriveSiteInfo {
                 $tenantSite    = Get-PnPTenantSite -Url $OneDriveUrl -ErrorAction Stop
                 $lockState     = $tenantSite.LockState.ToString()
                 $archiveStatus = $tenantSite.ArchiveStatus.ToString()
+                $ownerName = $tenantSite.OwnerName
+                # Owner may be a claims login (i:0#.f|membership|email) or a plain UPN
+                if     ($tenantSite.Owner -match '\|([^|]+)$') { $ownerEmail = $Matches[1] }
+                elseif ($tenantSite.Owner -match '@')          { $ownerEmail = $tenantSite.Owner }
             }
             catch {
                 Write-Log -Message "Unable to retrieve tenant site status: $($_.Exception.Message)" -Level Warning
@@ -439,12 +453,12 @@ function Show-OneDriveSiteInfo {
     Write-Host '  |' -ForegroundColor Cyan
     Write-Host '  |  Primary Owner:' -ForegroundColor Cyan
 
-    if ($null -ne $owner) {
-        $ownerDisplay = if (-not [string]::IsNullOrEmpty($owner.Email)) {
-            "$($owner.Title) ($($owner.Email))"
+    if (-not [string]::IsNullOrEmpty($ownerName)) {
+        $ownerDisplay = if (-not [string]::IsNullOrEmpty($ownerEmail)) {
+            "$ownerName ($ownerEmail)"
         }
         else {
-            $owner.LoginName
+            $ownerName
         }
         Write-Host "  |    $ownerDisplay" -ForegroundColor White
     }
@@ -670,6 +684,164 @@ function Invoke-GrantPermission {
     Read-Host "`n  Press Enter to return to the menu"
 }
 
+function Invoke-RemoveSiteAdmin {
+    param (
+        [string]   $OneDriveUrl,
+        [hashtable]$Config
+    )
+
+    Write-Log -Message "Starting remove site collection admin — URL: '$OneDriveUrl'."
+
+    # Fetch primary owner from admin centre first — Get-PnPSite.Owner does not reflect
+    # changes made via Set-PnPTenantSite -Owner, so the admin centre is the source of truth.
+    $primaryOwnerEmail = $null
+    $adminUrl = Get-AdminCenterUrl -OneDriveUrl $OneDriveUrl
+    if ($adminUrl) {
+        $adminConnected = Connect-ToAdminCenter -AdminUrl $adminUrl -Config $Config
+        if ($adminConnected) {
+            try {
+                $tenantSite = Get-PnPTenantSite -Url $OneDriveUrl -ErrorAction Stop
+                if     ($tenantSite.Owner -match '\|([^|]+)$') { $primaryOwnerEmail = $Matches[1].ToLower() }
+                elseif ($tenantSite.Owner -match '@')          { $primaryOwnerEmail = $tenantSite.Owner.ToLower() }
+            }
+            catch {
+                Write-Log -Message "Unable to retrieve primary owner from admin centre: $($_.Exception.Message)" -Level Warning
+            }
+            finally {
+                try { Disconnect-PnPOnline -ErrorAction SilentlyContinue } catch {}
+            }
+        }
+    }
+
+    $connected = Connect-ToOneDriveSite -SiteUrl $OneDriveUrl -Config $Config
+    if (-not $connected) {
+        Write-Host ''
+        Write-Host '  Unable to connect to the OneDrive site. Check the log for details.' -ForegroundColor Red
+        Read-Host "`n  Press Enter to return to the menu"
+        return
+    }
+
+    try {
+        $admins = @(Get-CurrentSiteAdmins)
+
+        $removable = @($admins | Where-Object {
+            $e = if (-not [string]::IsNullOrEmpty($_.Email)) { $_.Email.ToLower() } else { $null }
+            -not ($primaryOwnerEmail -and $e -and ($e -eq $primaryOwnerEmail))
+        })
+
+        if ($removable.Count -eq 0) {
+            Write-Host ''
+            Write-Host '  No removable site collection admins found.' -ForegroundColor Yellow
+            Write-Host '  (The primary owner is excluded from this list.)' -ForegroundColor DarkGray
+            Read-Host "`n  Press Enter to return to the menu"
+            return
+        }
+
+        # Numbered list
+        Write-Host ''
+        Write-Host '  Site Collection Admins  (primary owner excluded):' -ForegroundColor Cyan
+        Write-Host ''
+        for ($i = 0; $i -lt $removable.Count; $i++) {
+            $a = $removable[$i]
+            $d = if (-not [string]::IsNullOrEmpty($a.Email)) { "$($a.Title) ($($a.Email))" } else { $a.LoginName }
+            Write-Host "    [$($i + 1)]  $d" -ForegroundColor White
+        }
+        Write-Host ''
+        Write-Host '    [A]  All of the above' -ForegroundColor White
+        Write-Host '    [B]  Back' -ForegroundColor White
+        Write-Host ''
+
+        $raw = (Read-Host '  Enter selection (e.g. 1  or  1,3  or  A)').Trim().ToUpper()
+
+        if ($raw -eq 'B') { return }
+
+        $toRemove = @()
+        if ($raw -eq 'A') {
+            $toRemove = $removable
+        }
+        else {
+            # Deduplicate via index set
+            $seen = [System.Collections.Generic.HashSet[int]]::new()
+            foreach ($token in ($raw -split ',')) {
+                $t = $token.Trim()
+                if ($t -match '^\d+$') {
+                    $n = [int]$t
+                    if ($n -ge 1 -and $n -le $removable.Count) {
+                        if ($seen.Add($n - 1)) {
+                            $toRemove += $removable[$n - 1]
+                        }
+                    }
+                    else {
+                        Write-Host "  '$t' is out of range — ignored." -ForegroundColor Yellow
+                    }
+                }
+                else {
+                    Write-Host "  '$t' is not a valid number — ignored." -ForegroundColor Yellow
+                }
+            }
+        }
+
+        if ($toRemove.Count -eq 0) {
+            Write-Host '  No valid admins selected.' -ForegroundColor Yellow
+            Read-Host "`n  Press Enter to return to the menu"
+            return
+        }
+
+        # Confirmation
+        Write-Host ''
+        Write-Host '  The following will be removed as site collection admins:' -ForegroundColor Cyan
+        foreach ($a in $toRemove) {
+            $d = if (-not [string]::IsNullOrEmpty($a.Email)) { "$($a.Title) ($($a.Email))" } else { $a.LoginName }
+            Write-Host "    - $d" -ForegroundColor White
+        }
+        Write-Host ''
+
+        $confirm = Read-Host '  Proceed? (Y/N)'
+        if ($confirm.Trim().ToUpper() -ne 'Y') {
+            Write-Log -Message 'Remove site collection admin cancelled by operator.' -Level Warning
+            Write-Host "`n  Operation cancelled." -ForegroundColor Yellow
+            Read-Host "`n  Press Enter to return to the menu"
+            return
+        }
+
+        # Perform removal
+        $results = [ordered]@{}
+        foreach ($a in $toRemove) {
+            $identity = if (-not [string]::IsNullOrEmpty($a.Email)) { $a.Email } else { $a.LoginName }
+            $display  = if (-not [string]::IsNullOrEmpty($a.Email)) { "$($a.Title) ($($a.Email))" } else { $a.LoginName }
+            try {
+                Remove-PnPSiteCollectionAdmin -Owners @($identity) -ErrorAction Stop
+                Write-Log -Message "Removed site collection admin: '$display'."
+                $results[$display] = $true
+            }
+            catch {
+                Write-Log -Message "Failed to remove '$display': $($_.Exception.Message)" -Level Error
+                $results[$display] = $false
+            }
+        }
+
+        # Result summary
+        Write-Host ''
+        Write-Host '  +--------------------------------------------------+' -ForegroundColor Cyan
+        Write-Host '  |  Result Summary                                  |' -ForegroundColor Cyan
+        Write-Host '  +--------------------------------------------------+' -ForegroundColor Cyan
+        foreach ($key in $results.Keys) {
+            $label = if ($results[$key]) { 'REMOVED' } else { 'FAILED ' }
+            $color = if ($results[$key]) { 'Green'  } else { 'Red'   }
+            Write-Host "  |  $key" -ForegroundColor White
+            Write-Host '  |    Status : ' -NoNewline -ForegroundColor Cyan
+            Write-Host $label -ForegroundColor $color
+            Write-Host '  |' -ForegroundColor Cyan
+        }
+        Write-Host '  +--------------------------------------------------+' -ForegroundColor Cyan
+    }
+    finally {
+        try { Disconnect-PnPOnline -ErrorAction SilentlyContinue } catch {}
+    }
+
+    Read-Host "`n  Press Enter to return to the menu"
+}
+
 #endregion
 
 #region Permission Sub-Menu
@@ -752,11 +924,13 @@ function Show-MainMenu {
     Write-Host ''
     Write-Host '  ------------------------------------------------' -ForegroundColor DarkGray
 
-    $checkColor = if ($urlIsSet) { 'White' } else { 'DarkGray' }
-    $grantColor = if ($urlIsSet -and $upnIsSet) { 'White' } else { 'DarkGray' }
+    $checkColor  = if ($urlIsSet) { 'White' } else { 'DarkGray' }
+    $grantColor  = if ($urlIsSet -and $upnIsSet) { 'White' } else { 'DarkGray' }
+    $removeColor = if ($urlIsSet) { 'White' } else { 'DarkGray' }
 
     Write-Host '    [C]  Check Site Info  (Owner, Admins, Lock State, Archive Status)' -ForegroundColor $checkColor
     Write-Host '    [G]  Grant Permission' -ForegroundColor $grantColor
+    Write-Host '    [R]  Remove Site Collection Admin' -ForegroundColor $removeColor
     Write-Host '    [Q]  Quit' -ForegroundColor White
     Write-Host '  ------------------------------------------------' -ForegroundColor DarkGray
     Write-Host ''
@@ -838,13 +1012,22 @@ function Start-InteractiveMenu {
                 Show-PermissionSubMenu -OneDriveUrl $currentUrl -UserUPN $currentUPN -Config $Config
             }
 
+            'R' {
+                if ([string]::IsNullOrEmpty($currentUrl)) {
+                    Write-Host "`n  Please set a OneDrive URL first (press [U])." -ForegroundColor Yellow
+                    Start-Sleep -Seconds 2
+                    break
+                }
+                Invoke-RemoveSiteAdmin -OneDriveUrl $currentUrl -Config $Config
+            }
+
             'Q' {
                 Write-Log -Message 'Script terminated by user.'
                 $exit = $true
             }
 
             default {
-                Write-Host "`n  Invalid option. Press U, C, P, G, or Q." -ForegroundColor Red
+                Write-Host "`n  Invalid option. Press U, C, P, G, R, or Q." -ForegroundColor Red
                 Start-Sleep -Seconds 1
             }
         }

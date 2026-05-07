@@ -1,12 +1,11 @@
 # Change-OneDrivePermission
 
-Grants **Owner** and/or **Site Collection Admin** permissions on a OneDrive for
-Business (personal) site using certificate-based app-only authentication via
-PnP.PowerShell.
+Inspects and manages **Owner** and **Site Collection Admin** permissions on a OneDrive for
+Business (personal) site using certificate-based app-only authentication via PnP.PowerShell.
 
 Supports both **active** OneDrive profiles and **retained** profiles of deleted users
 (shown as *Profile Missing* in the SharePoint Admin Centre). Existing site collection
-admins are never removed — new admins are always added alongside them.
+admins are never removed when adding a new one.
 
 ---
 
@@ -104,6 +103,8 @@ PnP.PowerShell resolves the thumbprint from the macOS login Keychain automatical
 
 ## Required App Registration Permissions
 
+### API Permission
+
 The Entra ID app registration must have the following **Application** permission with
 **admin consent** granted:
 
@@ -114,6 +115,17 @@ The Entra ID app registration must have the following **Application** permission
 > **Why `Sites.FullControl.All`?**  
 > Modifying ownership and site collection admin membership requires full control.
 > Lower scopes such as `Sites.ReadWrite.All` do not permit permission changes.
+
+### Directory Role
+
+The app's **service principal** must also be assigned the **SharePoint Administrator**
+directory role in Entra ID. Without it, tenant-level write operations (site unlock,
+owner assignment) will fail with a Forbidden error.
+
+To assign:
+1. **Entra ID** → **Enterprise applications** → select your app
+2. **Roles and administrators** → **Add assignments**
+3. Search for and assign **SharePoint Administrator**
 
 ---
 
@@ -169,24 +181,54 @@ The Entra ID app registration must have the following **Application** permission
 
   Current Selection:
     [U] OneDrive URL  :  (not set)
-    [P] User UPN      :  (not set)
+    [P] User UPN      :  (not set — required to grant permissions)
 
   ------------------------------------------------
+    [C]  Check Site Info  (Owner, Admins, Lock State, Archive Status)
     [G]  Grant Permission
+    [R]  Remove Site Collection Admin
     [Q]  Quit
   ------------------------------------------------
 ```
 
-| Key | Action |
-|---|---|
-| `U` | Set or change the target OneDrive URL |
-| `P` | Set or change the user UPN to grant access to |
-| `G` | Open the permission type sub-menu |
-| `Q` | Quit the script |
+| Key | Requires URL | Requires UPN | Action |
+|---|---|---|---|
+| `U` | — | — | Set or change the target OneDrive URL |
+| `P` | — | — | Set or change the user UPN |
+| `C` | Yes | No | Display site info: primary owner, all site collection admins, lock state, and archive status |
+| `G` | Yes | Yes | Open the Grant Permission sub-menu |
+| `R` | Yes | No | Open the Remove Site Collection Admin sub-menu |
+| `Q` | — | — | Quit the script |
 
-### Permission Sub-Menu
+### Check Site Info (`C`)
 
-After pressing `G`, you select what to grant:
+Connects to the OneDrive site and the SharePoint Admin Centre and displays:
+
+```
+  +--------------------------------------------------+
+  |  Site Information                                |
+  +--------------------------------------------------+
+  |  OneDrive : https://contoso-my.sharepoint.com/personal/john_doe_contoso_com
+  |
+  |  Site Status:
+  |    Lock State     : Unlock
+  |    Archive Status : NotArchived
+  |
+  |  Primary Owner:
+  |    John Doe (john.doe@contoso.com)
+  |
+  |  Site Collection Admins:
+  |    - John Doe (john.doe@contoso.com)
+  |    - Admin User (admin@contoso.com)
+  +--------------------------------------------------+
+```
+
+**Lock State** colour coding: `Unlock` = green, `ReadOnly` = yellow, `NoAccess` = red.  
+**Archive Status** colour coding: `NotArchived` = green, `Archived`/`Reactivating` = yellow, `FullyArchived` = red.
+
+### Grant Permission (`G`)
+
+After pressing `G`, select the permission type:
 
 ```
 +================================================+
@@ -211,16 +253,31 @@ After pressing `G`, you select what to grant:
 | `3` | Does both: adds as site collection admin first, then sets as owner |
 | `B` | Returns to the main menu without making changes |
 
-### Confirmation & Result
+Before any change is applied, the script displays existing admins, the pending action, and
+prompts **Y/N** to confirm.
 
-Before any change is applied, the script:
+### Remove Site Collection Admin (`R`)
 
-1. Displays all **existing** site collection admins.
-2. Shows a summary of the pending action.
-3. Warns if the current owner will be replaced (options 1 and 3).
-4. Prompts **Y/N** to confirm.
+Lists all current site collection admins with the primary owner excluded (the primary owner
+cannot be removed from this list). Select by number, comma-separated list, or `A` for all:
 
-After the operation, a result summary is shown:
+```
+  Site Collection Admins  (primary owner excluded):
+
+    [1]  Admin User (admin@contoso.com)
+    [2]  Support Team (support@contoso.com)
+
+    [A]  All of the above
+    [B]  Back
+
+  Enter selection (e.g. 1  or  1,3  or  A):
+```
+
+A confirmation prompt is shown before any removal is performed.
+
+### Result Summary
+
+After each grant or remove operation:
 
 ```
   +--------------------------------------------------+
@@ -233,8 +290,6 @@ After the operation, a result summary is shown:
   |  Site Collection Admin: SUCCESS
   +--------------------------------------------------+
 ```
-
-The menu reappears automatically after each operation, ready for the next input.
 
 ---
 
@@ -252,6 +307,33 @@ To find the URL of a OneDrive site (including retained/deleted profiles):
 1. Go to [SharePoint Admin Centre](https://admin.microsoft.com) → **SharePoint** → **Sites** → **Active sites**
 2. Filter by **Template: Personal Site**
 3. For deleted users: go to **Deleted sites** or look under **Profile Missing** sites
+
+---
+
+## Known Limitations
+
+> ### ⚠ Changing Primary Owner on Profile Missing Sites
+>
+> For OneDrive sites of **departed users in "Profile Missing" state** (account deleted,
+> site retained by a retention policy), the `Set-PnPTenantSite -Owner` API call returns
+> success but **does not apply the change**. This is a SharePoint Online platform
+> limitation specific to app-only authentication — it is not a permissions or script issue.
+>
+> The script detects this silent failure by re-querying the site after the set operation
+> and will report **FAILED** with an explanatory warning if the owner did not change.
+>
+> **Workaround:** Change the primary owner manually in the SharePoint Admin Centre:
+> > **Active sites** → select the site → **Membership** tab → **Primary admin**
+>
+> This works because the Admin Centre uses delegated authentication (your signed-in admin
+> session), which does not have the same restriction.
+>
+> **What the script CAN do for Profile Missing sites:**
+> - ✅ Inspect site info (owner, admins, lock state, archive status)
+> - ✅ Grant Site Collection Admin access
+> - ✅ Remove Site Collection Admin access
+> - ✅ Unlock the site if locked
+> - ❌ Change primary owner (use Admin Centre instead)
 
 ---
 
@@ -284,7 +366,7 @@ console (Green = Info, Yellow = Warning, Red = Error) and written as plain text.
 > When a user is deleted from Entra ID but their OneDrive is held by a retention policy,
 > the site still exists and is accessible via its original URL. The app-only connection
 > used by this script works regardless of whether the original owner account is still
-> active.
+> active. See [Known Limitations](#known-limitations) for the primary owner restriction.
 
 > **App-only context**  
 > The script connects as the application, not as a named user. All changes are
