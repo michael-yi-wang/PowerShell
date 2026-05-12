@@ -33,40 +33,38 @@ The script will prompt you to install the module if it is not found.
 
 ---
 
-### 2. Certificate for App-Only Authentication
+### 2. Entra ID App Registration
 
-The script uses a certificate (identified by its SHA1 thumbprint) to authenticate as
-the app registration without a user context. The app registration must already have the
-certificate's **public key** (.cer) uploaded. The **private key** must be present on the
-machine running this script.
+The script authenticates as an app registration using a certificate (app-only, no user
+context required). You need:
 
-#### Get the Thumbprint of an Existing Certificate
+- An app registration in Entra ID with `Sites.FullControl.All` application permission (admin consent granted)
+- A certificate with the **public key** (.cer) uploaded to the app registration
+- The **private key** installed in the local certificate store on any machine running this script
 
-**Windows (PowerShell):**
-```powershell
-Get-ChildItem -Path Cert:\CurrentUser\My | Select-Object Subject, Thumbprint, NotAfter
-```
+See [Required Permissions](#required-permissions) for the full permission table.
 
-**macOS (PowerShell):**
-```powershell
-security find-certificate -a -p | openssl x509 -noout -fingerprint -sha1
-```
+---
 
-#### Create a New Self-Signed Certificate (if needed)
+### 3. Certificate for App-Only Authentication
+
+#### Create a New Self-Signed Certificate
 
 **Windows:**
 ```powershell
 $cert = New-SelfSignedCertificate `
-    -Subject       "CN=SPO-AppOnly" `
+    -Subject           "CN=SPO-AppOnly" `
     -CertStoreLocation "Cert:\CurrentUser\My" `
-    -KeyExportPolicy Exportable `
-    -KeySpec       Signature `
-    -NotAfter      (Get-Date).AddYears(2)
+    -KeyExportPolicy   Exportable `
+    -KeySpec           Signature `
+    -KeyLength         2048 `
+    -HashAlgorithm     SHA256 `
+    -NotAfter          (Get-Date).AddYears(2)
 
-# Note the thumbprint
+# Note the thumbprint — you will need it for the config file
 $cert.Thumbprint
 
-# Export public key to upload to the app registration
+# Export the public key to upload to the app registration
 Export-Certificate -Cert $cert -FilePath ".\SPO-AppOnly.cer"
 ```
 
@@ -75,13 +73,25 @@ Export-Certificate -Cert $cert -FilePath ".\SPO-AppOnly.cer"
 openssl req -x509 -newkey rsa:2048 -keyout private.key -out public.cer \
     -days 730 -nodes -subj "/CN=SPO-AppOnly"
 
-# Combine into a PFX for import into Keychain (macOS) or cert store
+# Combine into a PFX for import
 openssl pkcs12 -export -out SPO-AppOnly.pfx -inkey private.key -in public.cer
+```
+
+#### Get the Thumbprint of an Existing Certificate
+
+**Windows:**
+```powershell
+Get-ChildItem -Path Cert:\CurrentUser\My | Select-Object Subject, Thumbprint, NotAfter
+```
+
+**macOS:**
+```powershell
+security find-certificate -a -p | openssl x509 -noout -fingerprint -sha1
 ```
 
 #### Install the Certificate
 
-**Windows** — import into the CurrentUser personal store:
+**Windows** — import the PFX into `CurrentUser\My`:
 ```powershell
 Import-PfxCertificate -FilePath ".\SPO-AppOnly.pfx" `
     -CertStoreLocation "Cert:\CurrentUser\My" `
@@ -92,14 +102,43 @@ Import-PfxCertificate -FilePath ".\SPO-AppOnly.pfx" `
 ```bash
 security import SPO-AppOnly.pfx -k ~/Library/Keychains/login.keychain-db
 ```
-PnP.PowerShell resolves the thumbprint from the macOS login Keychain automatically.
 
 #### Upload the Public Key to the App Registration
 
-1. Open the [Azure Portal](https://portal.azure.com) → **Entra ID** → **App registrations**
-2. Select your app → **Certificates & secrets** → **Certificates**
-3. Click **Upload certificate** and select the `.cer` (public key) file
-4. Note the **Thumbprint** shown after upload — this is the value you pass to the script
+1. Open [Entra ID](https://entra.microsoft.com) → **App registrations** → select your app
+2. Go to **Certificates & secrets** → **Certificates**
+3. Click **Upload certificate** and select the `.cer` (public key only) file
+4. Note the **Thumbprint** shown after upload — this value goes into `config.json`
+
+---
+
+### 4. Create the Config File
+
+Copy the template and fill in the three values:
+
+```powershell
+Copy-Item ".\config.json.template" ".\config.json"
+```
+
+Edit `config.json`:
+```json
+{
+    "AppId"      : "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "Thumbprint" : "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+    "TenantId"   : "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+}
+```
+
+| Field | Where to find it |
+|-------|-----------------|
+| `AppId` | Entra ID → App registrations → your app → **Application (client) ID** |
+| `Thumbprint` | Entra ID → App registrations → your app → Certificates & secrets → Certificates |
+| `TenantId` | Entra ID → Overview → **Tenant ID**, or your primary domain (e.g. `contoso.onmicrosoft.com`) |
+
+> **Security:** `config.json` is not committed to source control. Add it to `.gitignore`
+> and treat the file access (via NTFS permissions or macOS file ACLs) as you would any
+> credential file. The certificate private key — the actual secret — stays protected in
+> the OS certificate store and never appears in the config file.
 
 ---
 
@@ -121,7 +160,27 @@ and **admin consented**:
 
 ## Usage
 
-### Option A — Individual Parameters
+### Default — Config File (no parameters needed)
+
+Place `config.json` in the same folder as the script, then run:
+
+```powershell
+.\Clear-SPOStaleUser.ps1
+```
+
+The script reads `config.json` automatically.
+
+---
+
+### Specify an Alternate Config File
+
+```powershell
+.\Clear-SPOStaleUser.ps1 -ConfigFile "C:\Scripts\spo-config.json"
+```
+
+---
+
+### Supply Credentials Directly
 
 ```powershell
 .\Clear-SPOStaleUser.ps1 `
@@ -130,34 +189,20 @@ and **admin consented**:
     -TenantId   "contoso.onmicrosoft.com"
 ```
 
-### Option B — JSON Config File
-
-```powershell
-.\Clear-SPOStaleUser.ps1 -ConfigFile ".\config.json"
-```
-
-**config.json format:**
-```json
-{
-    "AppId"      : "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-    "Thumbprint" : "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
-    "TenantId"   : "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-}
-```
-
-> Store `config.json` outside the repository or add it to `.gitignore` to avoid
-> accidentally committing your App ID and Thumbprint.
-
 ---
 
 ## Parameter Reference
 
-| Parameter | Parameter Set | Required | Description |
-|---|---|---|---|
-| `-AppId` | `Individual` | Yes | Application (Client) ID of the Entra ID app registration |
-| `-Thumbprint` | `Individual` | Yes | SHA1 thumbprint of the authentication certificate |
-| `-TenantId` | `Individual` | Yes | Entra ID Tenant ID (GUID) or primary domain name |
-| `-ConfigFile` | `ConfigFile` | Yes | Path to a JSON file containing the three fields above |
+| Parameter | Parameter Set | Required | Default | Description |
+|---|---|---|---|---|
+| `-ConfigFile` | `ConfigFile` | No | `config.json` next to script | Path to JSON config file |
+| `-AppId` | `Individual` | Yes | — | Application (Client) ID of the Entra ID app registration |
+| `-Thumbprint` | `Individual` | Yes | — | SHA1 thumbprint of the authentication certificate |
+| `-TenantId` | `Individual` | Yes | — | Entra ID Tenant ID (GUID) or primary domain name |
+
+`ConfigFile` is the default parameter set. Running the script with no arguments reads
+`config.json` from the script directory. Individual parameters are mutually exclusive
+with the config-file approach.
 
 ---
 
@@ -195,10 +240,11 @@ Only site collection root URLs are accepted. Sub-site paths are rejected.
 | `https://contoso.sharepoint.com` | `https://contoso.sharepoint.com/sites/site/subsite` |
 | `https://contoso.sharepoint.com/sites/finance` | |
 | `https://contoso.sharepoint.com/teams/marketing` | |
+| `https://contoso-my.sharepoint.com/personal/j_doe_contoso_com` | |
 
 **Check behaviour:**
 - If the user **is found** on the site, their profile is displayed and you are prompted
-  to confirm removal.
+  to confirm removal (Y/N).
 - If the user **is not found**, a message is shown and the menu reappears — no action is
   taken.
 
@@ -209,9 +255,10 @@ Only site collection root URLs are accepted. Sub-site paths are rejected.
 Logs are written to a `logs/` subfolder in the same directory as the script:
 
 ```
-Clear-SPOStaleUser/
+CLear-SPOStaleUser/
 ├── Clear-SPOStaleUser.ps1
-├── config.json            (optional, not committed)
+├── config.json.template
+├── config.json               (created by admin; not committed to source control)
 └── logs/
     ├── Clear-SPOStaleUser_20260504_143022.log
     └── Clear-SPOStaleUser_20260505_090100.log
@@ -220,6 +267,20 @@ Clear-SPOStaleUser/
 Each run creates a new timestamped log file. Log entries are colour-coded in the
 console (Green = Info, Yellow = Warning, Red = Error) and written in plain text to
 the file.
+
+---
+
+## Certificate Renewal
+
+When the certificate expires or is replaced:
+
+1. Generate the new certificate and upload the new public key (`.cer`) to the Entra ID
+   app registration. Keep the old certificate in the registration during the transition.
+2. Install the new certificate's private key on all machines running this script.
+3. Update `config.json` — change the `Thumbprint` value to the new certificate's thumbprint.
+4. Remove the old certificate from the app registration once all machines are updated.
+
+Only the `Thumbprint` field in `config.json` changes. `AppId` and `TenantId` are unchanged.
 
 ---
 
@@ -245,6 +306,5 @@ the file.
 > before running the script on macOS.
 
 > **Permissions scope:** `Sites.FullControl.All` grants the app full control over
-> **all** site collections in the tenant. Follow the principle of least privilege —
-> use a dedicated app registration for this script and do not reuse it for other
-> purposes.
+> **all** site collections in the tenant. Use a dedicated app registration for this
+> script and do not reuse it for other purposes.

@@ -12,23 +12,21 @@
     A "stale user" is an account that persists in a site's User Information List
     even though the user is no longer active in the organisation.
 
-.PARAMETER AppId
-    The Application (Client) ID of the Entra ID app registration.
-    Used with the 'Individual' parameter set.
+    DEFAULT USE
+    -----------
+    Run the script with no parameters. It will automatically read connection
+    settings from config.json located in the same folder as this script.
 
-.PARAMETER Thumbprint
-    The SHA1 certificate thumbprint used for app-only authentication.
-    On Windows the certificate must be in the CurrentUser\My store.
-    On macOS the certificate must be imported into the login Keychain.
-    Used with the 'Individual' parameter set.
-
-.PARAMETER TenantId
-    The Entra ID tenant ID (GUID) or primary domain (e.g. contoso.onmicrosoft.com).
-    Used with the 'Individual' parameter set.
+    CONFIGURATION / RENEWAL
+    -----------------------
+    Copy config.json.template to config.json and fill in the three values.
+    Update Thumbprint whenever the app certificate is renewed. The AppId and
+    TenantId rarely change.
 
 .PARAMETER ConfigFile
-    Path to a JSON file containing AppId, Thumbprint, and TenantId.
-    Used with the 'ConfigFile' parameter set.
+    Path to a JSON configuration file containing AppId, Thumbprint, and TenantId.
+    Defaults to 'config.json' in the same directory as this script, allowing
+    the script to run without specifying any parameters.
 
     Expected format:
     {
@@ -37,25 +35,59 @@
         "TenantId"   : "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
     }
 
-.EXAMPLE
-    .\Clear-SPOStaleUser.ps1 -AppId "00000000-0000-0000-0000-000000000000" `
-                             -Thumbprint "ABC123DEF456..." `
-                             -TenantId "contoso.onmicrosoft.com"
+.PARAMETER AppId
+    The Application (Client) ID of the Entra ID app registration.
+    Required only when NOT using a config file (advanced / automation use).
+
+.PARAMETER Thumbprint
+    The SHA1 certificate thumbprint used for app-only authentication.
+    On Windows the certificate must be in the CurrentUser\My store.
+    On macOS the certificate must be imported into the login Keychain.
+    Required only when NOT using a config file (advanced / automation use).
+
+.PARAMETER TenantId
+    The Entra ID tenant ID (GUID) or primary domain (e.g. contoso.onmicrosoft.com).
+    Required only when NOT using a config file (advanced / automation use).
 
 .EXAMPLE
-    .\Clear-SPOStaleUser.ps1 -ConfigFile ".\config.json"
+    .\Clear-SPOStaleUser.ps1
+
+    Reads connection settings from config.json in the same folder as the script.
+
+.EXAMPLE
+    .\Clear-SPOStaleUser.ps1 -ConfigFile "C:\Scripts\spo-config.json"
+
+    Reads connection settings from the specified config file.
+
+.EXAMPLE
+    .\Clear-SPOStaleUser.ps1 -AppId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+                             -Thumbprint "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" `
+                             -TenantId "contoso.onmicrosoft.com"
+
+    Supplies connection details directly on the command line.
 
 .NOTES
     Author   : Michael Wang
-    Version  : 1.0.0
+    Version  : 1.1.0
     Requires : PowerShell 7.0+, PnP.PowerShell module
 
     The Entra ID app registration must hold the SharePoint application permission:
         Sites.FullControl.All  (admin consent required)
+
+    The signing certificate identified by Thumbprint must be installed in the
+    local certificate store before running this script:
+        Windows : CurrentUser\My  (certmgr.msc)
+        macOS   : login Keychain
 #>
 
-[CmdletBinding(DefaultParameterSetName = 'Individual')]
+[CmdletBinding(DefaultParameterSetName = 'ConfigFile')]
 param (
+    # ConfigFile is optional; defaults to config.json next to the script so the
+    # script can run with no arguments at all.
+    [Parameter(ParameterSetName = 'ConfigFile',
+        HelpMessage = 'Path to JSON configuration file (default: config.json next to script)')]
+    [string]$ConfigFile = (Join-Path $PSScriptRoot 'config.json'),
+
     [Parameter(Mandatory, ParameterSetName = 'Individual',
         HelpMessage = 'Entra ID Application (Client) ID')]
     [ValidateNotNullOrEmpty()]
@@ -69,12 +101,7 @@ param (
     [Parameter(Mandatory, ParameterSetName = 'Individual',
         HelpMessage = 'Entra ID Tenant ID or primary domain')]
     [ValidateNotNullOrEmpty()]
-    [string]$TenantId,
-
-    [Parameter(Mandatory, ParameterSetName = 'ConfigFile',
-        HelpMessage = 'Path to JSON configuration file')]
-    [ValidateScript({ Test-Path $_ -PathType Leaf })]
-    [string]$ConfigFile
+    [string]$TenantId
 )
 
 Set-StrictMode -Version Latest
@@ -153,6 +180,25 @@ function Resolve-AppConfig {
     param ()
 
     if ($PSCmdlet.ParameterSetName -eq 'ConfigFile') {
+        if (-not (Test-Path -Path $ConfigFile -PathType Leaf)) {
+            Write-Host ''
+            Write-Host '  [ERROR] Configuration file not found:' -ForegroundColor Red
+            Write-Host "          $ConfigFile" -ForegroundColor Yellow
+            Write-Host ''
+            Write-Host '  To fix this, copy config.json.template to config.json' -ForegroundColor Cyan
+            Write-Host '  (in the same folder as the script) and fill in the values:' -ForegroundColor Cyan
+            Write-Host ''
+            Write-Host '    {' -ForegroundColor DarkGray
+            Write-Host '        "AppId"      : "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",' -ForegroundColor DarkGray
+            Write-Host '        "Thumbprint" : "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",' -ForegroundColor DarkGray
+            Write-Host '        "TenantId"   : "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"' -ForegroundColor DarkGray
+            Write-Host '    }' -ForegroundColor DarkGray
+            Write-Host ''
+            Write-Host '  Contact your IT administrator if you do not have these values.' -ForegroundColor Cyan
+            Write-Host ''
+            exit 1
+        }
+
         try {
             Write-Log -Message "Loading configuration from: $ConfigFile"
             $json = Get-Content -Path $ConfigFile -Raw -Encoding UTF8 |

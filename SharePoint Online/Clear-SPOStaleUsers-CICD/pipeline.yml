@@ -1,0 +1,182 @@
+trigger: none
+
+# ---------------------------------------------------------------------------
+# Parameters are supplied by the helpdesk wrapper (Invoke-SPOPipeline.ps1)
+# via the ADO Pipelines REST API, or entered manually when running the
+# pipeline from the ADO web UI.
+# ---------------------------------------------------------------------------
+parameters:
+  - name: SiteUrl
+    displayName: 'SharePoint Site URL'
+    type: string
+
+  - name: UserUPN
+    displayName: 'User UPN to remove'
+    type: string
+
+# ---------------------------------------------------------------------------
+# Variable group 'SPO-Helpdesk-Secrets' is linked to Azure Key Vault and
+# must contain the following secrets:
+#   AppId          — Entra ID app registration client ID
+#   Thumbprint     — Certificate thumbprint (SHA1)
+#   TenantId       — Entra ID tenant ID or primary domain
+#   CertPassword   — PFX certificate export password
+# ---------------------------------------------------------------------------
+variables:
+  - group: SPO-Helpdesk-Secrets
+
+stages:
+
+  # =========================================================================
+  # Stage 1 — Check: locate and display the stale user profile (read-only).
+  # Runs automatically on pipeline trigger. No approval required.
+  # =========================================================================
+  - stage: CheckUser
+    displayName: 'Stage 1 — Find Stale User'
+    jobs:
+      - job: FindStaleUser
+        displayName: 'Find stale user profile'
+        pool:
+          vmImage: 'windows-latest'
+
+        steps:
+
+          # -----------------------------------------------------------------
+          # Install PnP.PowerShell before the main script runs.
+          # Microsoft-hosted Windows agents do not include this module.
+          # -----------------------------------------------------------------
+          - task: PowerShell@2
+            displayName: 'Install PnP.PowerShell module'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Install-Module -Name PnP.PowerShell -Scope CurrentUser -Force -ErrorAction Stop
+                Write-Host 'PnP.PowerShell installed.'
+              pwsh: true
+
+          # -----------------------------------------------------------------
+          # Download the PFX certificate from ADO Secure Files library.
+          # The secure file must be named 'spo-helpdesk-app.pfx'.
+          # -----------------------------------------------------------------
+          - task: DownloadSecureFile@1
+            name: AppCert
+            displayName: 'Download app certificate'
+            inputs:
+              secureFile: 'spo-helpdesk-app.pfx'
+
+          # -----------------------------------------------------------------
+          # Import the PFX into the agent's CurrentUser\My certificate store
+          # so that PnP.PowerShell can locate it by thumbprint.
+          # -----------------------------------------------------------------
+          - task: PowerShell@2
+            displayName: 'Install certificate'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $certPath = '$(AppCert.secureFilePath)'
+                $certPass = ConvertTo-SecureString '$(CertPassword)' -AsPlainText -Force
+                Import-PfxCertificate -FilePath $certPath `
+                                      -CertStoreLocation 'Cert:\CurrentUser\My' `
+                                      -Password $certPass | Out-Null
+                Write-Host 'Certificate installed.'
+              pwsh: true
+
+          # -----------------------------------------------------------------
+          # Run the script in CheckOnly mode — no changes are made.
+          # Output serves as the audit trail before the approval gate.
+          # -----------------------------------------------------------------
+          - task: PowerShell@2
+            displayName: 'Check user profile'
+            inputs:
+              targetType: 'filePath'
+              filePath: '$(Build.SourcesDirectory)/SharePoint Online/Clear-SPOStaleUsers-CICD/Clear-SPOStaleUser.ps1'
+              arguments: >-
+                -AppId "$(AppId)"
+                -Thumbprint "$(Thumbprint)"
+                -TenantId "$(TenantId)"
+                -SiteUrl "${{ parameters.SiteUrl }}"
+                -UserUPN "${{ parameters.UserUPN }}"
+                -CheckOnly
+              pwsh: true
+
+  # =========================================================================
+  # Stage 2 — Remove: permanently removes the stale user profile.
+  # Uses a deployment job targeting the 'SPO-Helpdesk-Approval' environment.
+  # An Approvals check on that environment gates execution until a designated
+  # approver (e.g. IT helpdesk manager) explicitly approves the removal.
+  # =========================================================================
+  - stage: RemoveUser
+    displayName: 'Stage 2 — Remove Stale User'
+    dependsOn: CheckUser
+    condition: succeeded()
+    jobs:
+      - deployment: RemoveStaleUser
+        displayName: 'Remove stale user (requires approval)'
+        environment: 'SPO-Helpdesk-Approval'
+        pool:
+          vmImage: 'windows-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+
+                # -------------------------------------------------------------
+                # Explicitly check out the repository so the script file is
+                # available (deployment jobs do not check out by default).
+                # -------------------------------------------------------------
+                - checkout: self
+
+                # -------------------------------------------------------------
+                # Install PnP.PowerShell on the removal agent.
+                # -------------------------------------------------------------
+                - task: PowerShell@2
+                  displayName: 'Install PnP.PowerShell module'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      Install-Module -Name PnP.PowerShell -Scope CurrentUser -Force -ErrorAction Stop
+                      Write-Host 'PnP.PowerShell installed.'
+                    pwsh: true
+
+                # -------------------------------------------------------------
+                # Download the PFX certificate from ADO Secure Files library.
+                # -------------------------------------------------------------
+                - task: DownloadSecureFile@1
+                  name: AppCert
+                  displayName: 'Download app certificate'
+                  inputs:
+                    secureFile: 'spo-helpdesk-app.pfx'
+
+                # -------------------------------------------------------------
+                # Import the certificate into the agent's certificate store.
+                # -------------------------------------------------------------
+                - task: PowerShell@2
+                  displayName: 'Install certificate'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      $certPath = '$(AppCert.secureFilePath)'
+                      $certPass = ConvertTo-SecureString '$(CertPassword)' -AsPlainText -Force
+                      Import-PfxCertificate -FilePath $certPath `
+                                            -CertStoreLocation 'Cert:\CurrentUser\My' `
+                                            -Password $certPass | Out-Null
+                      Write-Host 'Certificate installed.'
+                    pwsh: true
+
+                # -------------------------------------------------------------
+                # Run the script in Force mode to perform the removal.
+                # This step only executes after the approval gate is cleared.
+                # -------------------------------------------------------------
+                - task: PowerShell@2
+                  displayName: 'Remove stale user'
+                  inputs:
+                    targetType: 'filePath'
+                    filePath: '$(Build.SourcesDirectory)/SharePoint Online/Clear-SPOStaleUsers-CICD/Clear-SPOStaleUser.ps1'
+                    arguments: >-
+                      -AppId "$(AppId)"
+                      -Thumbprint "$(Thumbprint)"
+                      -TenantId "$(TenantId)"
+                      -SiteUrl "${{ parameters.SiteUrl }}"
+                      -UserUPN "${{ parameters.UserUPN }}"
+                      -Force
+                    pwsh: true
