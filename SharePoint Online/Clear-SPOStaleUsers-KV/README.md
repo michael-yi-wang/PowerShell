@@ -9,22 +9,28 @@
 ```
 Helpdesk machine
 │
-├─ 4 non-secret environment variables (set by Intune / GPO)
+├─ 4 required + 1 optional environment variables (set by Intune / GPO)
 │    SPO_APP_ID, SPO_TENANT_ID, SPO_KV_URL, SPO_CERT_THUMBPRINT
+│    SPO_LA_WORKSPACE_ID  ← optional, enables Log Analytics remote logging
 │
 ├─ Certificate (CurrentUser\My)  ─── silent SP auth ──►  Azure Key Vault
 │                                                         ├─ spo-app-id
 │                                                         ├─ spo-tenant-id
-│                                                         └─ spo-thumbprint
+│                                                         ├─ spo-thumbprint
+│                                                         └─ spo-la-workspace-key  (optional)
 │
-└─ Retrieved secrets ─── certificate auth ──►  SharePoint Online
-                                                (interactive menu)
+├─ Retrieved secrets ─── certificate auth ──►  SharePoint Online
+│                                               (interactive menu)
+│
+└─ Log entries ──────────────────────────────►  Log Analytics workspace
+                                                SPOStaleUser_CL table  (optional)
 ```
 
 Key benefits:
 - No sensitive values on disk.
 - Certificate renewal is managed centrally in Key Vault — admin updates Key Vault first, then deploys the new cert via Intune at their own pace.
 - All Key Vault secret access is audited in Azure Monitor.
+- Optional Log Analytics integration centralises all helpdesk activity in one place for audit and alerting.
 
 ---
 
@@ -35,6 +41,7 @@ Key benefits:
 - A **certificate** installed in the app registration and on each helpdesk machine (`CurrentUser\My`).
 - Helpdesk machines running **Windows** (Intune-managed recommended for scale).
 - PowerShell modules on each machine: `PnP.PowerShell`, `Az.Accounts`, `Az.KeyVault`.
+- *(Optional)* An **Azure Log Analytics workspace** if you want centralised remote logging (see Section 5).
 
 ---
 
@@ -107,7 +114,9 @@ New-AzKeyVault `
 
 > **RBAC authorization model** is required. Do not use the legacy access-policy model.
 
-### 4b. Store the three secrets
+### 4b. Store the secrets
+
+**Required secrets (3):**
 
 ```powershell
 Set-AzKeyVaultSecret `
@@ -125,6 +134,17 @@ Set-AzKeyVaultSecret `
     -Name 'spo-thumbprint' `
     -SecretValue (ConvertTo-SecureString '<Certificate Thumbprint>' -AsPlainText -Force)
 ```
+
+**Optional secret (Log Analytics — only required if `SPO_LA_WORKSPACE_ID` is set):**
+
+```powershell
+Set-AzKeyVaultSecret `
+    -VaultName 'contoso-spo-kv' `
+    -Name 'spo-la-workspace-key' `
+    -SecretValue (ConvertTo-SecureString '<Log Analytics Primary or Secondary Key>' -AsPlainText -Force)
+```
+
+> Retrieve the workspace key from: **Log Analytics workspace** > **Settings** > **Agents** > **Log Analytics agent instructions** > **Primary key**.
 
 ### 4c. Grant the service principal access to Key Vault
 
@@ -147,7 +167,94 @@ Get-AzRoleAssignment `
 
 ---
 
-## 5. Step 3 — Helpdesk Machine Setup
+## 5. Step 2b — Log Analytics Workspace (Optional)
+
+Configuring a Log Analytics workspace enables centralised, queryable audit logs for all helpdesk sessions across every machine. When enabled, each `Write-Log` call in the script sends an entry to the **`SPOStaleUser_CL`** custom table in addition to the local log file.
+
+> **This section is entirely optional.** Skip it if local file logs are sufficient.
+
+### 5a. Create a Log Analytics workspace
+
+```powershell
+# Use an existing resource group or create one
+New-AzResourceGroup -Name 'rg-spo-helpdesk' -Location 'australiaeast'
+
+New-AzOperationalInsightsWorkspace `
+    -ResourceGroupName 'rg-spo-helpdesk' `
+    -Name 'law-spo-helpdesk' `
+    -Location 'australiaeast' `
+    -Sku 'PerGB2018'
+```
+
+### 5b. Retrieve the Workspace ID and key
+
+```powershell
+$workspace = Get-AzOperationalInsightsWorkspace `
+    -ResourceGroupName 'rg-spo-helpdesk' `
+    -Name 'law-spo-helpdesk'
+
+# Workspace ID — goes into the SPO_LA_WORKSPACE_ID environment variable
+$workspace.CustomerId
+
+# Primary key — goes into the 'spo-la-workspace-key' Key Vault secret
+(Get-AzOperationalInsightsWorkspaceSharedKey `
+    -ResourceGroupName 'rg-spo-helpdesk' `
+    -Name 'law-spo-helpdesk').PrimarySharedKey
+```
+
+Alternatively, retrieve the values from the Azure portal:
+**Log Analytics workspace** > **Settings** > **Agents** > **Log Analytics agent instructions**.
+
+### 5c. Store the workspace key in Key Vault
+
+```powershell
+$laKey = (Get-AzOperationalInsightsWorkspaceSharedKey `
+    -ResourceGroupName 'rg-spo-helpdesk' `
+    -Name 'law-spo-helpdesk').PrimarySharedKey
+
+Set-AzKeyVaultSecret `
+    -VaultName 'contoso-spo-kv' `
+    -Name 'spo-la-workspace-key' `
+    -SecretValue (ConvertTo-SecureString $laKey -AsPlainText -Force)
+```
+
+### 5d. Set the environment variable via Intune
+
+Add `SPO_LA_WORKSPACE_ID` to the same Intune Configuration Profile that delivers the other four environment variables:
+
+| Variable | Value |
+|----------|-------|
+| `SPO_LA_WORKSPACE_ID` | GUID shown in `$workspace.CustomerId` |
+
+Once the policy syncs, the script will forward all log entries to the `SPOStaleUser_CL` table.
+
+### 5e. Query logs in Log Analytics
+
+After at least one script run, the custom table will be available. Example KQL queries:
+
+```kql
+// All activity from the last 7 days
+SPOStaleUser_CL
+| where TimeGenerated >= ago(7d)
+| project TimeGenerated, Level_s, Message_s, Computer_s, UserName_s
+| order by TimeGenerated desc
+
+// Removal events only
+SPOStaleUser_CL
+| where Message_s has "Removed user"
+| project TimeGenerated, Computer_s, UserName_s, Message_s
+
+// Errors and warnings
+SPOStaleUser_CL
+| where Level_s in ("Error", "Warning")
+| project TimeGenerated, Level_s, Message_s, Computer_s
+```
+
+> **Note:** The `SPOStaleUser_CL` table is created automatically on the first log ingestion. Allow up to 15 minutes for the table and first entries to appear after the initial run.
+
+---
+
+## 6. Step 3 — Helpdesk Machine Setup
 
 ### 5a. Install the Certificate
 
@@ -195,12 +302,13 @@ Configure the following **machine-scope** environment variables using Intune:
 - **Recommended method**: Configuration Profile > Settings Catalog > search for "Environment Variables" (Windows).
 - **Alternative**: Custom OMA-URI policy (see below).
 
-| Variable | Value |
-|----------|-------|
-| `SPO_APP_ID` | Application (Client) ID of the Entra ID app registration |
-| `SPO_TENANT_ID` | Tenant ID (GUID) or primary domain (e.g. `contoso.onmicrosoft.com`) |
-| `SPO_KV_URL` | `https://contoso-spo-kv.vault.azure.net` |
-| `SPO_CERT_THUMBPRINT` | SHA1 thumbprint of the installed certificate |
+| Variable | Required | Value |
+|----------|----------|-------|
+| `SPO_APP_ID` | Yes | Application (Client) ID of the Entra ID app registration |
+| `SPO_TENANT_ID` | Yes | Tenant ID (GUID) or primary domain (e.g. `contoso.onmicrosoft.com`) |
+| `SPO_KV_URL` | Yes | `https://contoso-spo-kv.vault.azure.net` |
+| `SPO_CERT_THUMBPRINT` | Yes | SHA1 thumbprint of the installed certificate |
+| `SPO_LA_WORKSPACE_ID` | No | Workspace ID (GUID) from the Log Analytics workspace. When present, enables remote logging to the `SPOStaleUser_CL` table. Requires the `spo-la-workspace-key` secret in Key Vault. |
 
 **Custom OMA-URI example** (for one variable; repeat for each):
 
@@ -223,7 +331,7 @@ $env:SPO_CERT_THUMBPRINT
 
 ---
 
-## 6. Certificate Renewal Procedure
+## 7. Certificate Renewal Procedure
 
 Follow these steps in order to renew the certificate without interrupting helpdesk operations:
 
@@ -257,7 +365,7 @@ Follow these steps in order to renew the certificate without interrupting helpde
 
 ---
 
-## 7. Helpdesk Usage
+## 8. Helpdesk Usage
 
 No parameters are needed. Simply run:
 
@@ -283,18 +391,19 @@ The script will:
 
 ---
 
-## 8. Security Notes
+## 9. Security Notes
 
 - The **four environment variables are not secrets** — they are public identifiers (GUIDs, domain names, URLs, and a certificate thumbprint). They carry no risk if observed.
 - The **only sensitive asset is the certificate private key**, which is protected by the Windows certificate store using OS-level ACLs. Only the certificate owner (the logged-in user) can use it.
 - **Azure Key Vault** provides the authoritative source of truth for all connection values. Access to secrets is controlled by RBAC and fully audited.
 - All Key Vault secret reads are logged in **Azure Monitor / Key Vault diagnostic logs** — enable these in the Key Vault's Diagnostic settings and route to a Log Analytics workspace.
 - The script writes a **local log file** to the `logs\` subfolder next to the script for each session. Logs contain no secret values — only operational events.
+- When Log Analytics is enabled, logs are forwarded over HTTPS using an HMAC-SHA256 shared key signature. The workspace key is retrieved at runtime from Key Vault and held in memory only for the duration of the session — it is never written to disk.
 - The certificate used for authentication has no browser-based OAuth flow, eliminating the risk of token theft via phishing.
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
@@ -306,3 +415,5 @@ The script will:
 | Thumbprint mismatch warning appears | Certificate renewal is in progress (expected) | Wait for Intune to deliver updated cert and env var; no action required from helpdesk |
 | "Connection failed to SPO" | App registration missing `Sites.FullControl.All` permission, or cert mismatch | Verify API permission and admin consent in Entra ID portal; confirm KV thumbprint matches deployed cert |
 | Script exits immediately with no menu | Module check failed | Run `Install-Module -Name Az.Accounts -Scope CurrentUser -Force` etc. as directed by the on-screen message |
+| Log Analytics warning: "key not found in Key Vault" | `SPO_LA_WORKSPACE_ID` env var is set but `spo-la-workspace-key` secret was not created in Key Vault | Follow Section 5c to store the workspace key, or remove `SPO_LA_WORKSPACE_ID` to disable remote logging |
+| `SPOStaleUser_CL` table missing in Log Analytics | Table is created on first ingestion and can take up to 15 minutes to appear | Wait 15 minutes and re-run; verify `SPO_LA_WORKSPACE_ID` is correct and `spo-la-workspace-key` is valid |

@@ -26,10 +26,18 @@
       SPO_KV_URL          – Azure Key Vault URL  (e.g. https://contoso-spo-kv.vault.azure.net)
       SPO_CERT_THUMBPRINT – SHA1 thumbprint of the SP certificate installed locally
 
+    Optional environment variable (enables remote logging to Log Analytics):
+      SPO_LA_WORKSPACE_ID – Azure Log Analytics Workspace ID (GUID). When set,
+                            all log entries are also forwarded to the workspace's
+                            'SPOStaleUser_CL' custom table. Requires a matching
+                            'spo-la-workspace-key' secret stored in Key Vault.
+
     Azure Key Vault secrets (created by admin):
-      spo-app-id     – Client ID (admin-managed copy)
-      spo-tenant-id  – Tenant ID (admin-managed copy)
-      spo-thumbprint – Current certificate thumbprint (renewal signal)
+      spo-app-id           – Client ID (admin-managed copy)
+      spo-tenant-id        – Tenant ID (admin-managed copy)
+      spo-thumbprint       – Current certificate thumbprint (renewal signal)
+      spo-la-workspace-key – Log Analytics primary/secondary key (only required
+                             when SPO_LA_WORKSPACE_ID is set)
 
     HELPDESK USE
     ------------
@@ -53,7 +61,7 @@
 
 .NOTES
     Author   : Michael Wang
-    Version  : 2.0.0
+    Version  : 2.1.0
     Requires : PowerShell 7.0+, PnP.PowerShell module, Az.Accounts module, Az.KeyVault module
 
     The Entra ID app registration must hold the SharePoint application permission:
@@ -76,6 +84,7 @@ $ErrorActionPreference = 'Stop'
 
 $script:LogDir  = Join-Path -Path $PSScriptRoot -ChildPath 'logs'
 $script:LogFile = Join-Path -Path $script:LogDir -ChildPath "Clear-SPOStaleUser_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$script:LAConfig = $null   # populated after Key Vault retrieval if SPO_LA_WORKSPACE_ID is set
 
 if (-not (Test-Path -Path $script:LogDir -PathType Container)) {
     New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null
@@ -84,6 +93,55 @@ if (-not (Test-Path -Path $script:LogDir -PathType Container)) {
 #endregion
 
 #region Logging
+
+function Send-LogToLogAnalytics {
+    # Silently forwards a log entry to Azure Monitor via the HTTP Data Collector API.
+    # No-ops immediately when $script:LAConfig is not initialised.
+    param (
+        [Parameter(Mandatory)]
+        [string]$Message,
+
+        [ValidateSet('Info', 'Warning', 'Error')]
+        [string]$Level = 'Info'
+    )
+
+    if ($null -eq $script:LAConfig) { return }
+
+    try {
+        $logEntry = [pscustomobject]@{
+            TimeGenerated = (Get-Date -Format 'o')
+            Level         = $Level
+            Message       = $Message
+            Computer      = $env:COMPUTERNAME
+            UserName      = ($env:USERNAME ?? $env:USER ?? 'unknown')
+            ScriptVersion = '2.1.0'
+        }
+
+        $body      = ConvertTo-Json -InputObject @($logEntry) -Compress
+        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+        $dateUtc   = [DateTime]::UtcNow.ToString('r')
+
+        $stringToSign = "POST`n$($bodyBytes.Length)`napplication/json`nx-ms-date:$dateUtc`n/api/logs"
+        $keyBytes     = [System.Convert]::FromBase64String($script:LAConfig.WorkspaceKey)
+        $hmac         = [System.Security.Cryptography.HMACSHA256]::new($keyBytes)
+        $signature    = [System.Convert]::ToBase64String(
+                            $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($stringToSign))
+                        )
+
+        $headers = @{
+            'Authorization' = "SharedKey $($script:LAConfig.WorkspaceId):$signature"
+            'Content-Type'  = 'application/json'
+            'x-ms-date'     = $dateUtc
+            'Log-Type'      = 'SPOStaleUser'
+        }
+
+        $uri = "https://$($script:LAConfig.WorkspaceId).ods.opinsights.azure.com/api/logs?api-version=2016-04-01"
+        Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $bodyBytes -ErrorAction Stop | Out-Null
+    }
+    catch {
+        # Remote logging failures are non-fatal; the local log file is the primary record.
+    }
+}
 
 function Write-Log {
     param (
@@ -105,6 +163,8 @@ function Write-Log {
         'Error'   { 'Red'    }
     }
     Write-Host $entry -ForegroundColor $color
+
+    Send-LogToLogAnalytics -Message $Message -Level $Level
 }
 
 #endregion
@@ -289,11 +349,30 @@ function Resolve-AppConfig {
         Write-Host ''
     }
 
-    # ── Step 8: Return KV-sourced configuration ───────────────────────────────
+    # ── Step 8: Optionally retrieve Log Analytics workspace configuration ────────
+    $laWorkspaceId = $env:SPO_LA_WORKSPACE_ID
+    if (-not [string]::IsNullOrWhiteSpace($laWorkspaceId)) {
+        try {
+            $laKey = Get-AzKeyVaultSecret -VaultName $kvName -Name 'spo-la-workspace-key' -AsPlainText -ErrorAction Stop
+            if ([string]::IsNullOrWhiteSpace($laKey)) {
+                throw "Secret 'spo-la-workspace-key' exists but is empty."
+            }
+            $kvValues['LAWorkspaceId']  = $laWorkspaceId
+            $kvValues['LAWorkspaceKey'] = $laKey
+            Write-Log -Message "Log Analytics workspace configured (ID: $laWorkspaceId)."
+        }
+        catch {
+            Write-Log -Message "Log Analytics key not found in Key Vault; remote logging disabled. $_" -Level Warning
+        }
+    }
+
+    # ── Step 9: Return KV-sourced configuration ───────────────────────────────
     return @{
-        AppId      = $kvValues['AppId']
-        TenantId   = $kvValues['TenantId']
-        Thumbprint = $kvThumbprint
+        AppId          = $kvValues['AppId']
+        TenantId       = $kvValues['TenantId']
+        Thumbprint     = $kvThumbprint
+        LAWorkspaceId  = $kvValues['LAWorkspaceId']
+        LAWorkspaceKey = $kvValues['LAWorkspaceKey']
     }
 }
 
@@ -585,6 +664,14 @@ Write-Log -Message "Script started. Log file: $script:LogFile"
 
 $appConfig = Resolve-AppConfig
 Write-Log -Message "Configuration loaded from Key Vault. AppId: $($appConfig.AppId)  TenantId: $($appConfig.TenantId)"
+
+if ($appConfig.LAWorkspaceId -and $appConfig.LAWorkspaceKey) {
+    $script:LAConfig = @{
+        WorkspaceId  = $appConfig.LAWorkspaceId
+        WorkspaceKey = $appConfig.LAWorkspaceKey
+    }
+    Write-Log -Message 'Log Analytics remote logging enabled.'
+}
 
 Start-InteractiveMenu -Config $appConfig
 
