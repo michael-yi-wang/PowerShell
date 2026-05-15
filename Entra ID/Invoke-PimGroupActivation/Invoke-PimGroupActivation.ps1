@@ -44,9 +44,14 @@ param (
 
 # --- Configuration & Logging ---
 $ScriptFolder = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$LogFile = Join-Path $ScriptFolder "Invoke-PimGroupActivation_$Timestamp.log"
-$CsvOutput = Join-Path $ScriptFolder "Invoke-PimGroupActivation_Results_$Timestamp.csv"
+$LogFolder    = Join-Path $ScriptFolder "logs"
+$Timestamp    = Get-Date -Format "yyyyMMdd_HHmmss"
+$LogFile      = Join-Path $LogFolder "Invoke-PimGroupActivation_$Timestamp.log"
+$CsvOutput    = Join-Path $LogFolder "Invoke-PimGroupActivation_Results_$Timestamp.csv"
+
+if (-not (Test-Path $LogFolder)) {
+    New-Item -ItemType Directory -Path $LogFolder | Out-Null
+}
 
 function Write-Log {
     [CmdletBinding()]

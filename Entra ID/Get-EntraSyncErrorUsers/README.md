@@ -1,0 +1,195 @@
+# Get-EntraSyncErrorUsers
+
+Queries Microsoft Graph to collect all **Entra Connect (Azure AD Connect) synchronization errors** across users, groups, and organizational contacts, exports the results as a dated CSV, and uploads the file to a SharePoint Online document library.
+
+Designed to run daily via **Windows Task Scheduler** (certificate-based, non-interactive) or manually in a PowerShell console (interactive login).
+
+---
+
+## Features
+
+- Retrieves sync errors from all object types: **Users**, **Groups**, **Organizational Contacts**
+- Categorizes every error into one of seven groups, matching the **Microsoft Entra Connect Health** portal:
+
+| Report Category | Raw Graph Categories |
+|---|---|
+| **Duplicate Attribute** | `PropertyConflict`, `AttributeValueMustBeUnique`, `MatchedWithSoftmatch`, `GeneratedUpnConflict` |
+| **Data Mismatch** | `InvalidSoftMatch`, `InvalidHardMatch`, `ObjectTypeMismatch`, `DomainMismatch` |
+| **Data Validation Failure** | `DataValidationFailed`, `DataValidationFailure`, `DomainNotVerified`, `ExchangeObjectConflict`, `ExternalGovObjectDataValidationFailure` |
+| **Large Attribute** | `LargeObject`, `ExceededAllowedLength` |
+| **Federated Domain Change** | `FederatedDomainChange`, `FederatedDomainChangeError`, `InvalidFederatedUser` |
+| **Existing Admin Role Conflict** | `AdminRoleConflict`, `ExistingAdminRole` |
+| **Other** | All remaining categories |
+
+- Exports a detailed CSV with one row per error (objects with multiple errors produce multiple rows)
+- Creates year/month folder hierarchy in SharePoint automatically
+- Writes a timestamped log file alongside the CSV
+- Supports both interactive and certificate-based (app-only) authentication
+
+---
+
+## Prerequisites
+
+### PowerShell Modules
+
+```powershell
+Install-Module Microsoft.Graph.Users                        -Scope CurrentUser
+Install-Module Microsoft.Graph.Groups                       -Scope CurrentUser
+Install-Module Microsoft.Graph.Identity.DirectoryManagement -Scope CurrentUser
+Install-Module PnP.PowerShell                               -Scope CurrentUser
+```
+
+### App Registration (required for Task Scheduler / non-interactive runs)
+
+1. Go to **Entra ID → App registrations → New registration**
+2. Name: e.g. `EntraSyncErrorReport`
+3. Under **API permissions → Add a permission → Microsoft Graph → Application permissions**, add:
+   - `User.Read.All`
+   - `Group.Read.All`
+   - `OrgContact.Read.All`
+4. Grant **admin consent**
+5. Under **Certificates & secrets → Certificates**, upload a certificate (`.cer` file).  
+   Install the matching private key (`.pfx`) in the certificate store on the machine running the script:
+   - For Task Scheduler running as `SYSTEM`: `Local Machine\My`
+   - For a named service account: `Current User\My`
+6. Record the **Application (client) ID** and the certificate **thumbprint**
+
+### SharePoint Permissions (for app-only upload)
+
+Assign the App Registration one of:
+- `Sites.ReadWrite.All` (tenant-wide)
+- **OR** `Sites.Selected` scoped to the target site via Microsoft Graph API / PnP PowerShell
+
+---
+
+## Parameters
+
+| Parameter | Required | Default | Description |
+|---|---|---|---|
+| `-TenantId` | Yes | — | Entra ID tenant GUID |
+| `-ClientId` | No* | — | App Registration client ID |
+| `-CertificateThumbprint` | No* | — | Certificate thumbprint for non-interactive auth |
+| `-SharePointSiteUrl` | No** | — | Full SharePoint site URL |
+| `-SharePointDocumentLibrary` | No | `Documents` | Document library URL name (not display name) |
+| `-SharePointBaseFolderPath` | No | `Entra Sync Errors` | Base folder inside the library |
+| `-OutputPath` | No | Script directory | Local folder for CSV and log files |
+| `-SkipSharePointUpload` | No | — | Skip SharePoint upload; generate local files only |
+
+\* Both `-ClientId` and `-CertificateThumbprint` must be provided together to enable non-interactive auth.  
+\*\* Required unless `-SkipSharePointUpload` is specified.
+
+---
+
+## Usage
+
+### Manual Run (Interactive Login)
+
+```powershell
+.\Get-EntraSyncErrorUsers.ps1 `
+    -TenantId            "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+    -SharePointSiteUrl   "https://contoso.sharepoint.com/sites/IT" `
+    -SharePointDocumentLibrary "Documents"
+```
+
+### Non-Interactive Run (Task Scheduler / Certificate Auth)
+
+```powershell
+.\Get-EntraSyncErrorUsers.ps1 `
+    -TenantId              "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+    -ClientId              "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
+    -CertificateThumbprint "ABCDEF1234567890ABCDEF1234567890ABCDEF12" `
+    -SharePointSiteUrl     "https://contoso.sharepoint.com/sites/IT" `
+    -SharePointDocumentLibrary  "Documents" `
+    -SharePointBaseFolderPath   "Entra Sync Errors"
+```
+
+### Local Report Only (No SharePoint Upload)
+
+```powershell
+.\Get-EntraSyncErrorUsers.ps1 `
+    -TenantId           "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+    -SkipSharePointUpload `
+    -OutputPath         "C:\Reports"
+```
+
+---
+
+## Task Scheduler Setup
+
+1. Open **Task Scheduler** → **Create Task**
+
+2. **General** tab:
+   - Name: `Entra Sync Error Report`
+   - Run as: service account or `SYSTEM`
+   - Check **Run whether user is logged on or not**
+   - Check **Run with highest privileges**
+
+3. **Triggers** tab → **New**:
+   - Daily, at your preferred time (e.g. 06:00 AM)
+
+4. **Actions** tab → **New**:
+   - Program: `pwsh.exe`
+   - Arguments:
+     ```
+     -NonInteractive -File "C:\Scripts\Get-EntraSyncErrorUsers\Get-EntraSyncErrorUsers.ps1" -TenantId "..." -ClientId "..." -CertificateThumbprint "..." -SharePointSiteUrl "https://contoso.sharepoint.com/sites/IT" -SharePointDocumentLibrary "Documents"
+     ```
+
+5. **Settings** tab:
+   - Check **If the task fails, restart every**: 15 minutes, up to 3 times
+
+---
+
+## Output
+
+### CSV File
+
+**Filename:** `EntraSyncErrors_YYYYMMDD.csv`  
+**Location (local):** `<OutputPath>\EntraSyncErrors_YYYYMMDD.csv`  
+**Location (SharePoint):** `{Library}/{BaseFolderPath}/{YYYY}/{MMM}/EntraSyncErrors_YYYYMMDD.csv`
+
+Example SharePoint path:
+```
+Documents/Entra Sync Errors/2026/May/EntraSyncErrors_20260511.csv
+```
+
+### CSV Columns
+
+| Column | Description |
+|---|---|
+| `ObjectType` | `User`, `Group`, or `Contact` |
+| `ObjectId` | Entra ID object GUID |
+| `DisplayName` | Object display name |
+| `UserPrincipalName` | UPN (users only) |
+| `Mail` | Primary email address |
+| `OnPremisesDistinguishedName` | AD distinguished name |
+| `ErrorCategory` | One of: `Duplicate Attribute`, `Data Mismatch`, `Data Validation Failure`, `Large Attribute`, `Federated Domain Change`, `Existing Admin Role Conflict`, `Other` |
+| `RawErrorCategory` | Raw category value returned by Graph API |
+| `OccurredDateTime` | When the error was first detected (UTC) |
+| `PropertyCausingError` | The attribute name that caused the error |
+| `ConflictingValue` | The conflicting attribute value |
+| `AccountEnabled` | Account enabled status (users only) |
+| `Department` | Department (users only) |
+| `JobTitle` | Job title (users only) |
+| `OnPremisesImmutableId` | Immutable ID / Source Anchor (users only) |
+
+### Log File
+
+**Filename:** `Get-EntraSyncErrorUsers_YYYYMMDD_HHmmss.log`
+
+Each line is prefixed with a timestamp and level (`Info`, `Warning`, `Error`). The log includes a summary at the end showing error counts by category and object type.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely Cause | Fix |
+|---|---|---|
+| `Insufficient privileges` on Graph query | Missing API permissions or admin consent | Re-check app permissions and grant consent |
+| `AADSTS700027` certificate error | Wrong thumbprint or cert not in store | Verify thumbprint and reinstall `.pfx` |
+| `Access denied` on SharePoint upload | Missing site permissions | Assign `Sites.ReadWrite.All` or `Sites.Selected` |
+| `Resolve-PnPFolder` fails | Library URL name mismatch | Use the URL name of the library (check the browser address bar), not the display name |
+| Empty CSV every day | No sync errors exist | Expected behaviour; confirm in Entra ID portal under **Entra Connect → Sync errors** |
+| `Get-MgContact` returns no results | No OrgContacts in tenant | Normal if the tenant has no synchronized mail contacts |
+| `Request_UnsupportedQuery` / "filter property not indexed" | Older version of the script used `onPremisesProvisioningErrors/any()` which is not an indexed Graph filter | Use the current version — it filters by `onPremisesSyncEnabled eq true` server-side and filters locally |
+| CSV output is zero bytes | Ran the script with no sync errors on an older version | Use the current version which writes a headers-only CSV correctly |
+| "WARNING: partial data" in log | One or more Graph queries failed (e.g. missing `OrgContact.Read.All` permission) | Check the Warning entries above the summary in the log for the specific error |
