@@ -8,10 +8,14 @@
     Queries Microsoft Graph to collect Entra Connect (Azure AD Connect) synchronization
     errors for users, groups, and organizational contacts.
 
-    Errors are grouped into three categories:
-      - Duplicate Attribute    : PropertyConflict, AttributeValueMustBeUnique, etc.
-      - Data Validation Failure: Validation, domain, or federation-related errors.
-      - Other                  : All remaining error categories.
+    Errors are categorized to match the Microsoft Entra Connect Health portal's 7 buckets:
+      - Duplicate Attribute         : PropertyConflict, AttributeValueMustBeUnique, etc.
+      - Data Mismatch               : InvalidSoftMatch, InvalidHardMatch, ObjectTypeMismatch, etc.
+      - Data Validation Failure     : DataValidationFailed, ExchangeObjectConflict, etc.
+      - Large Attribute             : LargeObject, ExceededAllowedLength.
+      - Federated Domain Change     : FederatedDomainChange, InvalidFederatedUser, etc.
+      - Existing Admin Role Conflict: AdminRoleConflict, ExistingAdminRole.
+      - Other                       : All remaining categories.
 
     Results are exported to a dated CSV and optionally uploaded to SharePoint Online
     under the path: {DocumentLibrary}/{BaseFolderPath}/{YYYY}/{MMM}/{filename}.csv
@@ -191,50 +195,32 @@ function Get-SyncErrorCategory {
         [string]$RawCategory
     )
 
-    $duplicateAttributeCategories = @(
-        "PropertyConflict",
-        "MatchedWithSoftmatch",
-        "AttributeValueMustBeUnique",
-        "GeneratedUpnConflict"
-    )
+    # Categories mirror the Microsoft Entra Connect Health portal's 7 error buckets.
+    # Source: https://learn.microsoft.com/entra/identity/hybrid/connect/how-to-connect-health-sync
 
-    $dataValidationCategories = @(
-        "DataValidationFailed",
-        "DataValidationFailure",
-        "InvalidSoftMatch",
-        "DomainMismatch",
-        "DomainNotVerified",
-        "FederatedDomainChange",
-        "FederatedDomainChangeError",
-        "InvalidFederatedUser",
-        "ExchangeObjectConflict",
-        "ExternalGovObjectDataValidationFailure"
-    )
-
-    if ($RawCategory -in $duplicateAttributeCategories) {
-        return "Duplicate Attribute"
-    }
-    elseif ($RawCategory -in $dataValidationCategories) {
-        return "Data Validation Failure"
-    }
-    else {
-        return "Other"
-    }
-}
-
-function Get-IdentityString {
-    <#
-    .SYNOPSIS
-        Returns a non-empty identity string, preferring the first non-blank value.
-    #>
-    param ([string[]]$Candidates)
-
-    foreach ($candidate in $Candidates) {
-        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-            return $candidate
+    switch ($RawCategory) {
+        { $_ -in @("PropertyConflict", "AttributeValueMustBeUnique", "MatchedWithSoftmatch", "GeneratedUpnConflict") } {
+            return "Duplicate Attribute"
+        }
+        { $_ -in @("InvalidSoftMatch", "InvalidHardMatch", "ObjectTypeMismatch", "DomainMismatch") } {
+            return "Data Mismatch"
+        }
+        { $_ -in @("DataValidationFailed", "DataValidationFailure", "DomainNotVerified", "ExchangeObjectConflict", "ExternalGovObjectDataValidationFailure") } {
+            return "Data Validation Failure"
+        }
+        { $_ -in @("LargeObject", "ExceededAllowedLength") } {
+            return "Large Attribute"
+        }
+        { $_ -in @("FederatedDomainChange", "FederatedDomainChangeError", "InvalidFederatedUser") } {
+            return "Federated Domain Change"
+        }
+        { $_ -in @("AdminRoleConflict", "ExistingAdminRole") } {
+            return "Existing Admin Role Conflict"
+        }
+        default {
+            return "Other"
         }
     }
-    return ""
 }
 
 function ConvertTo-ErrorRows {
@@ -257,9 +243,9 @@ function ConvertTo-ErrorRows {
             ObjectType                  = $ObjectType
             ObjectId                    = $GraphObject.Id
             DisplayName                 = $GraphObject.DisplayName
-            UserPrincipalName           = if ($ObjectType -eq "User") { $GraphObject.UserPrincipalName } else { "" }
-            Mail                        = $GraphObject.Mail
-            OnPremisesDistinguishedName = $GraphObject.OnPremisesDistinguishedName
+            UserPrincipalName           = if ($ObjectType -eq "User") { $GraphObject.PSObject.Properties['UserPrincipalName']?.Value ?? "" } else { "" }
+            Mail                        = $GraphObject.PSObject.Properties['Mail']?.Value ?? ""
+            OnPremisesDistinguishedName = $GraphObject.PSObject.Properties['OnPremisesDistinguishedName']?.Value ?? ""
             ErrorCategory               = Get-SyncErrorCategory -RawCategory $provError.Category
             RawErrorCategory            = $provError.Category
             OccurredDateTime            = if ($provError.OccurredDateTime) {
@@ -267,10 +253,10 @@ function ConvertTo-ErrorRows {
                                           } else { "" }
             PropertyCausingError        = $provError.PropertyCausingError
             ConflictingValue            = $provError.Value
-            AccountEnabled              = if ($ObjectType -eq "User") { $GraphObject.AccountEnabled } else { "" }
-            Department                  = if ($ObjectType -eq "User") { $GraphObject.Department } else { "" }
-            JobTitle                    = if ($ObjectType -eq "User") { $GraphObject.JobTitle } else { "" }
-            OnPremisesImmutableId       = if ($ObjectType -eq "User") { $GraphObject.OnPremisesImmutableId } else { "" }
+            AccountEnabled              = if ($ObjectType -eq "User") { $GraphObject.PSObject.Properties['AccountEnabled']?.Value ?? "" } else { "" }
+            Department                  = if ($ObjectType -eq "User") { $GraphObject.PSObject.Properties['Department']?.Value ?? "" } else { "" }
+            JobTitle                    = if ($ObjectType -eq "User") { $GraphObject.PSObject.Properties['JobTitle']?.Value ?? "" } else { "" }
+            OnPremisesImmutableId       = if ($ObjectType -eq "User") { $GraphObject.PSObject.Properties['OnPremisesImmutableId']?.Value ?? "" } else { "" }
         })
     }
 
@@ -302,10 +288,14 @@ if (-not $SkipSharePointUpload) {
 }
 
 # Detect authentication mode
-$useAppOnlyAuth = (
-    -not [string]::IsNullOrWhiteSpace($ClientId) -and
-    -not [string]::IsNullOrWhiteSpace($CertificateThumbprint)
-)
+$clientIdProvided   = -not [string]::IsNullOrWhiteSpace($ClientId)
+$thumbprintProvided = -not [string]::IsNullOrWhiteSpace($CertificateThumbprint)
+
+if ($clientIdProvided -xor $thumbprintProvided) {
+    Write-Log -Message "Both -ClientId and -CertificateThumbprint must be provided together for non-interactive auth. Falling back to interactive login." -Level Warning
+}
+
+$useAppOnlyAuth = $clientIdProvided -and $thumbprintProvided
 
 Write-Log -Message "Auth Mode  : $(if ($useAppOnlyAuth) { 'App-Only (Certificate)' } else { 'Interactive (Delegated)' })"
 
@@ -348,31 +338,33 @@ catch {
 
 #region Query Sync Errors
 
-$allErrorRows = [System.Collections.Generic.List[PSCustomObject]]::new()
+$allErrorRows  = [System.Collections.Generic.List[PSCustomObject]]::new()
+$queryPartial  = $false
 
 # ── Users ────────────────────────────────────────────────────────────────────
 Write-Log -Message "Querying users with sync errors..."
 try {
     Write-Progress -Activity "Entra Sync Error Report" -Status "Querying users..." -PercentComplete 10
 
+    # Graph does not support onPremisesProvisioningErrors/any() as an indexed filter.
+    # Supported approach: filter by onPremisesSyncEnabled eq true (server-side), then
+    # filter locally for non-empty OnPremisesProvisioningErrors.
     $users = Get-MgUser `
-        -Filter           "onPremisesProvisioningErrors/any()" `
-        -Property         "id,displayName,userPrincipalName,mail,onPremisesDistinguishedName,onPremisesImmutableId,onPremisesProvisioningErrors,accountEnabled,department,jobTitle" `
+        -Filter      "onPremisesSyncEnabled eq true" `
+        -Property    "id,displayName,userPrincipalName,mail,onPremisesDistinguishedName,onPremisesImmutableId,onPremisesProvisioningErrors,accountEnabled,department,jobTitle" `
         -All `
-        -ConsistencyLevel "eventual" `
-        -CountVariable    userErrorCount `
-        -ErrorAction      Stop
+        -ErrorAction Stop |
+        Where-Object { @($_.OnPremisesProvisioningErrors).Count -gt 0 }
 
-    Write-Log -Message "Users with sync errors: $($users.Count)"
+    Write-Log -Message "Users with sync errors: $(@($users).Count)"
 
     foreach ($user in $users) {
-        if ($user.OnPremisesProvisioningErrors.Count -gt 0) {
-            $allErrorRows.AddRange((ConvertTo-ErrorRows -ObjectType "User" -GraphObject $user))
-        }
+        ConvertTo-ErrorRows -ObjectType "User" -GraphObject $user | ForEach-Object { $allErrorRows.Add($_) }
     }
 }
 catch {
     Write-Log -Message "Could not retrieve user sync errors: $_" -Level Warning
+    $queryPartial = $true
 }
 
 # ── Groups ───────────────────────────────────────────────────────────────────
@@ -381,23 +373,21 @@ try {
     Write-Progress -Activity "Entra Sync Error Report" -Status "Querying groups..." -PercentComplete 40
 
     $groups = Get-MgGroup `
-        -Filter           "onPremisesProvisioningErrors/any()" `
-        -Property         "id,displayName,mail,onPremisesDistinguishedName,onPremisesProvisioningErrors" `
+        -Filter      "onPremisesSyncEnabled eq true" `
+        -Property    "id,displayName,mail,onPremisesDistinguishedName,onPremisesProvisioningErrors" `
         -All `
-        -ConsistencyLevel "eventual" `
-        -CountVariable    groupErrorCount `
-        -ErrorAction      Stop
+        -ErrorAction Stop |
+        Where-Object { @($_.OnPremisesProvisioningErrors).Count -gt 0 }
 
-    Write-Log -Message "Groups with sync errors: $($groups.Count)"
+    Write-Log -Message "Groups with sync errors: $(@($groups).Count)"
 
     foreach ($group in $groups) {
-        if ($group.OnPremisesProvisioningErrors.Count -gt 0) {
-            $allErrorRows.AddRange((ConvertTo-ErrorRows -ObjectType "Group" -GraphObject $group))
-        }
+        ConvertTo-ErrorRows -ObjectType "Group" -GraphObject $group | ForEach-Object { $allErrorRows.Add($_) }
     }
 }
 catch {
     Write-Log -Message "Could not retrieve group sync errors: $_" -Level Warning
+    $queryPartial = $true
 }
 
 # ── Organizational Contacts ──────────────────────────────────────────────────
@@ -406,23 +396,21 @@ try {
     Write-Progress -Activity "Entra Sync Error Report" -Status "Querying contacts..." -PercentComplete 70
 
     $contacts = Get-MgContact `
-        -Filter           "onPremisesProvisioningErrors/any()" `
-        -Property         "id,displayName,mail,onPremisesDistinguishedName,onPremisesProvisioningErrors" `
+        -Filter      "onPremisesSyncEnabled eq true" `
+        -Property    "id,displayName,mail,onPremisesDistinguishedName,onPremisesProvisioningErrors" `
         -All `
-        -ConsistencyLevel "eventual" `
-        -CountVariable    contactErrorCount `
-        -ErrorAction      Stop
+        -ErrorAction Stop |
+        Where-Object { @($_.OnPremisesProvisioningErrors).Count -gt 0 }
 
-    Write-Log -Message "Contacts with sync errors: $($contacts.Count)"
+    Write-Log -Message "Contacts with sync errors: $(@($contacts).Count)"
 
     foreach ($contact in $contacts) {
-        if ($contact.OnPremisesProvisioningErrors.Count -gt 0) {
-            $allErrorRows.AddRange((ConvertTo-ErrorRows -ObjectType "Contact" -GraphObject $contact))
-        }
+        ConvertTo-ErrorRows -ObjectType "Contact" -GraphObject $contact | ForEach-Object { $allErrorRows.Add($_) }
     }
 }
 catch {
     Write-Log -Message "Could not retrieve contact sync errors: $_" -Level Warning
+    $queryPartial = $true
 }
 
 Write-Progress -Activity "Entra Sync Error Report" -Completed
@@ -451,25 +439,11 @@ try {
         $allErrorRows | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8 -Force
     }
     else {
-        # Write an empty CSV with the correct headers so the file is always present
-        [PSCustomObject]@{
-            ObjectType                  = ""
-            ObjectId                    = ""
-            DisplayName                 = ""
-            UserPrincipalName           = ""
-            Mail                        = ""
-            OnPremisesDistinguishedName = ""
-            ErrorCategory               = ""
-            RawErrorCategory            = ""
-            OccurredDateTime            = ""
-            PropertyCausingError        = ""
-            ConflictingValue            = ""
-            AccountEnabled              = ""
-            Department                  = ""
-            JobTitle                    = ""
-            OnPremisesImmutableId       = ""
-        } | Select-Object -First 0 |
-            Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8 -Force
+        # Write a headers-only CSV so the file is always present for downstream consumers.
+        # Export-Csv with Select-Object -First 0 produces a zero-byte file in PowerShell 7;
+        # writing the header line directly is the reliable alternative.
+        '"ObjectType","ObjectId","DisplayName","UserPrincipalName","Mail","OnPremisesDistinguishedName","ErrorCategory","RawErrorCategory","OccurredDateTime","PropertyCausingError","ConflictingValue","AccountEnabled","Department","JobTitle","OnPremisesImmutableId"' |
+            Set-Content -Path $csvFile -Encoding UTF8
 
         Write-Log -Message "No sync errors found. Empty CSV (headers only) written."
     }
@@ -546,8 +520,11 @@ else {
 $duration = (Get-Date) - $scriptStartTime
 
 Write-Log -Message "=== Script Completed ==="
-Write-Log -Message "Duration           : $($duration.ToString('hh\:mm\:ss'))"
+Write-Log -Message "Duration           : $($duration.ToString('d\.hh\:mm\:ss'))"
 Write-Log -Message "Total Error Records: $($allErrorRows.Count)"
+if ($queryPartial) {
+    Write-Log -Message "WARNING: One or more object type queries failed. The CSV may contain partial data." -Level Warning
+}
 
 if ($allErrorRows.Count -gt 0) {
     Write-Log -Message "--- By Category ---"

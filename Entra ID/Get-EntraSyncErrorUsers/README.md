@@ -9,12 +9,16 @@ Designed to run daily via **Windows Task Scheduler** (certificate-based, non-int
 ## Features
 
 - Retrieves sync errors from all object types: **Users**, **Groups**, **Organizational Contacts**
-- Categorizes every error into one of three groups:
+- Categorizes every error into one of seven groups, matching the **Microsoft Entra Connect Health** portal:
 
 | Report Category | Raw Graph Categories |
 |---|---|
-| **Duplicate Attribute** | `PropertyConflict`, `GeneratedUpnConflict`, `AttributeValueMustBeUnique`, `MatchedWithSoftmatch` |
-| **Data Validation Failure** | `DataValidationFailed`, `InvalidSoftMatch`, `DomainMismatch`, `DomainNotVerified`, `FederatedDomainChange`, `InvalidFederatedUser`, `ExchangeObjectConflict` |
+| **Duplicate Attribute** | `PropertyConflict`, `AttributeValueMustBeUnique`, `MatchedWithSoftmatch`, `GeneratedUpnConflict` |
+| **Data Mismatch** | `InvalidSoftMatch`, `InvalidHardMatch`, `ObjectTypeMismatch`, `DomainMismatch` |
+| **Data Validation Failure** | `DataValidationFailed`, `DataValidationFailure`, `DomainNotVerified`, `ExchangeObjectConflict`, `ExternalGovObjectDataValidationFailure` |
+| **Large Attribute** | `LargeObject`, `ExceededAllowedLength` |
+| **Federated Domain Change** | `FederatedDomainChange`, `FederatedDomainChangeError`, `InvalidFederatedUser` |
+| **Existing Admin Role Conflict** | `AdminRoleConflict`, `ExistingAdminRole` |
 | **Other** | All remaining categories |
 
 - Exports a detailed CSV with one row per error (objects with multiple errors produce multiple rows)
@@ -158,7 +162,7 @@ Documents/Entra Sync Errors/2026/May/EntraSyncErrors_20260511.csv
 | `UserPrincipalName` | UPN (users only) |
 | `Mail` | Primary email address |
 | `OnPremisesDistinguishedName` | AD distinguished name |
-| `ErrorCategory` | `Duplicate Attribute`, `Data Validation Failure`, or `Other` |
+| `ErrorCategory` | One of: `Duplicate Attribute`, `Data Mismatch`, `Data Validation Failure`, `Large Attribute`, `Federated Domain Change`, `Existing Admin Role Conflict`, `Other` |
 | `RawErrorCategory` | Raw category value returned by Graph API |
 | `OccurredDateTime` | When the error was first detected (UTC) |
 | `PropertyCausingError` | The attribute name that caused the error |
@@ -186,3 +190,6 @@ Each line is prefixed with a timestamp and level (`Info`, `Warning`, `Error`). T
 | `Resolve-PnPFolder` fails | Library URL name mismatch | Use the URL name of the library (check the browser address bar), not the display name |
 | Empty CSV every day | No sync errors exist | Expected behaviour; confirm in Entra ID portal under **Entra Connect → Sync errors** |
 | `Get-MgContact` returns no results | No OrgContacts in tenant | Normal if the tenant has no synchronized mail contacts |
+| `Request_UnsupportedQuery` / "filter property not indexed" | Older version of the script used `onPremisesProvisioningErrors/any()` which is not an indexed Graph filter | Use the current version — it filters by `onPremisesSyncEnabled eq true` server-side and filters locally |
+| CSV output is zero bytes | Ran the script with no sync errors on an older version | Use the current version which writes a headers-only CSV correctly |
+| "WARNING: partial data" in log | One or more Graph queries failed (e.g. missing `OrgContact.Read.All` permission) | Check the Warning entries above the summary in the log for the specific error |
