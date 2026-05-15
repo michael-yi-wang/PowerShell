@@ -23,7 +23,7 @@ Designed to run daily via **Windows Task Scheduler** (certificate-based, non-int
 
 - Exports a detailed CSV with one row per error (objects with multiple errors produce multiple rows)
 - Creates year/month folder hierarchy in SharePoint automatically
-- Writes a timestamped log file alongside the CSV
+- Writes CSV to `reports\` and log to `logs\` subdirectory under the output path
 - Supports both interactive and certificate-based (app-only) authentication
 
 ---
@@ -47,18 +47,39 @@ Install-Module PnP.PowerShell                               -Scope CurrentUser
    - `User.Read.All`
    - `Group.Read.All`
    - `OrgContact.Read.All`
-4. Grant **admin consent**
-5. Under **Certificates & secrets → Certificates**, upload a certificate (`.cer` file).  
+4. Under **API permissions → Add a permission → SharePoint → Application permissions**, add:
+   - `Sites.Selected`
+5. Grant **admin consent** for both sets of permissions
+6. Under **Certificates & secrets → Certificates**, upload a certificate (`.cer` file).  
    Install the matching private key (`.pfx`) in the certificate store on the machine running the script:
    - For Task Scheduler running as `SYSTEM`: `Local Machine\My`
    - For a named service account: `Current User\My`
-6. Record the **Application (client) ID** and the certificate **thumbprint**
+7. Record the **Application (client) ID** and the certificate **thumbprint**
 
-### SharePoint Permissions (for app-only upload)
+> **Note:** Microsoft Graph `Sites.Selected` and SharePoint `Sites.Selected` are **separate permissions** with different token audiences. Only the **SharePoint API** `Sites.Selected` is required for this script. Do not confuse them.
 
-Assign the App Registration one of:
-- `Sites.ReadWrite.All` (tenant-wide)
-- **OR** `Sites.Selected` scoped to the target site via Microsoft Graph API / PnP PowerShell
+### SharePoint Permissions (site-level grant)
+
+After adding the SharePoint `Sites.Selected` API permission, grant the app access to the specific site using PnP PowerShell (run as a SharePoint Admin):
+
+```powershell
+Connect-PnPOnline -Url "https://contoso.sharepoint.com/sites/IT" -Interactive
+
+Grant-PnPAzureADAppSitePermission `
+    -AppId      "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
+    -DisplayName "EntraSyncErrorReport" `
+    -Site       "https://contoso.sharepoint.com/sites/IT" `
+    -Permissions Manage
+```
+
+### Certificate Private Key Access (for Task Scheduler)
+
+When running as `SYSTEM` the private key must be accessible. To verify and fix:
+
+1. Open **MMC** as Administrator → Add **Certificates (Local Computer)** snap-in
+2. Navigate to **Personal → Certificates** → find the certificate
+3. Right-click → **All Tasks → Manage Private Keys**
+4. Confirm **SYSTEM** has **Full Control** (it does by default for LocalMachine\My certs)
 
 ---
 
@@ -71,8 +92,8 @@ Assign the App Registration one of:
 | `-CertificateThumbprint` | No* | — | Certificate thumbprint for non-interactive auth |
 | `-SharePointSiteUrl` | No** | — | Full SharePoint site URL |
 | `-SharePointDocumentLibrary` | No | `Documents` | Document library URL name (not display name) |
-| `-SharePointBaseFolderPath` | No | `Entra Sync Errors` | Base folder inside the library |
-| `-OutputPath` | No | Script directory | Local folder for CSV and log files |
+| `-SharePointBaseFolderPath` | No | `Entra Sync Errors` | Base folder inside the library. Supports multi-level paths e.g. `Reports/Entra Sync Errors` |
+| `-OutputPath` | No | Script directory | Base directory for output. CSVs go to `{OutputPath}\reports\`, logs to `{OutputPath}\logs\` |
 | `-SkipSharePointUpload` | No | — | Skip SharePoint upload; generate local files only |
 
 \* Both `-ClientId` and `-CertificateThumbprint` must be provided together to enable non-interactive auth.  
@@ -100,7 +121,7 @@ Assign the App Registration one of:
     -CertificateThumbprint "ABCDEF1234567890ABCDEF1234567890ABCDEF12" `
     -SharePointSiteUrl     "https://contoso.sharepoint.com/sites/IT" `
     -SharePointDocumentLibrary  "Documents" `
-    -SharePointBaseFolderPath   "Entra Sync Errors"
+    -SharePointBaseFolderPath   "Reports/Entra Sync Errors"
 ```
 
 ### Local Report Only (No SharePoint Upload)
@@ -120,7 +141,7 @@ Assign the App Registration one of:
 
 2. **General** tab:
    - Name: `Entra Sync Error Report`
-   - Run as: service account or `SYSTEM`
+   - Run as: `SYSTEM` (has built-in access to LocalMachine\My certificates)
    - Check **Run whether user is logged on or not**
    - Check **Run with highest privileges**
 
@@ -128,28 +149,41 @@ Assign the App Registration one of:
    - Daily, at your preferred time (e.g. 06:00 AM)
 
 4. **Actions** tab → **New**:
-   - Program: `pwsh.exe`
+   - Program: `C:\Program Files\PowerShell\7\pwsh.exe`
    - Arguments:
      ```
-     -NonInteractive -File "C:\Scripts\Get-EntraSyncErrorUsers\Get-EntraSyncErrorUsers.ps1" -TenantId "..." -ClientId "..." -CertificateThumbprint "..." -SharePointSiteUrl "https://contoso.sharepoint.com/sites/IT" -SharePointDocumentLibrary "Documents"
+     -NonInteractive -ExecutionPolicy Bypass -File "C:\Scripts\Get-EntraSyncErrorUsers\Get-EntraSyncErrorUsers.ps1" -TenantId "..." -ClientId "..." -CertificateThumbprint "..." -SharePointSiteUrl "https://contoso.sharepoint.com/sites/IT" -SharePointDocumentLibrary "Documents" -SharePointBaseFolderPath "Reports/Entra Sync Errors"
      ```
 
 5. **Settings** tab:
-   - Check **If the task fails, restart every**: 15 minutes, up to 3 times
+   - **If the task is already running**: Do not start a new instance
 
 ---
 
 ## Output
 
-### CSV File
+### Directory Structure
 
-**Filename:** `EntraSyncErrors_YYYYMMDD.csv`  
-**Location (local):** `<OutputPath>\EntraSyncErrors_YYYYMMDD.csv`  
-**Location (SharePoint):** `{Library}/{BaseFolderPath}/{YYYY}/{MMM}/EntraSyncErrors_YYYYMMDD.csv`
-
-Example SharePoint path:
 ```
-Documents/Entra Sync Errors/2026/May/EntraSyncErrors_20260511.csv
+<OutputPath>\
+├── reports\
+│   └── EntraSyncErrors_YYYYMMDD.csv
+└── logs\
+    └── Get-EntraSyncErrorUsers_YYYYMMDD_HHmmss.log
+```
+
+Both subdirectories are created automatically on first run.
+
+### SharePoint Path
+
+Files are uploaded under:
+```
+{Library}/{BaseFolderPath}/{YYYY}/{MMM}/EntraSyncErrors_YYYYMMDD.csv
+```
+
+Example:
+```
+Documents/Reports/Entra Sync Errors/2026/May/EntraSyncErrors_20260515.csv
 ```
 
 ### CSV Columns
@@ -174,7 +208,8 @@ Documents/Entra Sync Errors/2026/May/EntraSyncErrors_20260511.csv
 
 ### Log File
 
-**Filename:** `Get-EntraSyncErrorUsers_YYYYMMDD_HHmmss.log`
+**Filename:** `Get-EntraSyncErrorUsers_YYYYMMDD_HHmmss.log`  
+**Location:** `<OutputPath>\logs\`
 
 Each line is prefixed with a timestamp and level (`Info`, `Warning`, `Error`). The log includes a summary at the end showing error counts by category and object type.
 
@@ -185,11 +220,13 @@ Each line is prefixed with a timestamp and level (`Info`, `Warning`, `Error`). T
 | Symptom | Likely Cause | Fix |
 |---|---|---|
 | `Insufficient privileges` on Graph query | Missing API permissions or admin consent | Re-check app permissions and grant consent |
-| `AADSTS700027` certificate error | Wrong thumbprint or cert not in store | Verify thumbprint and reinstall `.pfx` |
-| `Access denied` on SharePoint upload | Missing site permissions | Assign `Sites.ReadWrite.All` or `Sites.Selected` |
-| `Resolve-PnPFolder` fails | Library URL name mismatch | Use the URL name of the library (check the browser address bar), not the display name |
+| `AADSTS700027` certificate error | Wrong thumbprint or cert not in store | Verify thumbprint; ensure `.pfx` is installed in the correct store |
+| `Keyset does not exist` | Certificate private key not accessible to the running account | Open MMC → Certificates (Local Computer) → Personal → right-click cert → **All Tasks → Manage Private Keys** → grant Read to the service account or SYSTEM |
+| `Unauthorized` (401) on SharePoint | Missing **SharePoint API** `Sites.Selected` permission | Add `SharePoint → Application → Sites.Selected` in the app registration (not Microsoft Graph) and grant admin consent |
+| `Access denied` on SharePoint upload | Site-level permission not granted | Run `Grant-PnPAzureADAppSitePermission` with `-Permissions Manage` for the target site |
+| `File Not Found` on folder creation | Document library URL name does not match `-SharePointDocumentLibrary` | Use the URL name from the browser address bar, not the display name |
 | Empty CSV every day | No sync errors exist | Expected behaviour; confirm in Entra ID portal under **Entra Connect → Sync errors** |
 | `Get-MgContact` returns no results | No OrgContacts in tenant | Normal if the tenant has no synchronized mail contacts |
-| `Request_UnsupportedQuery` / "filter property not indexed" | Older version of the script used `onPremisesProvisioningErrors/any()` which is not an indexed Graph filter | Use the current version — it filters by `onPremisesSyncEnabled eq true` server-side and filters locally |
+| `Request_UnsupportedQuery` | Older version used `onPremisesProvisioningErrors/any()` which is not an indexed Graph filter | Use the current version — it filters by `onPremisesSyncEnabled eq true` server-side |
 | CSV output is zero bytes | Ran the script with no sync errors on an older version | Use the current version which writes a headers-only CSV correctly |
-| "WARNING: partial data" in log | One or more Graph queries failed (e.g. missing `OrgContact.Read.All` permission) | Check the Warning entries above the summary in the log for the specific error |
+| "WARNING: partial data" in log | One or more Graph queries failed | Check the Warning entries above the summary in the log for the specific error |

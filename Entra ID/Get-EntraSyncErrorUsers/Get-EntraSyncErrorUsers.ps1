@@ -48,7 +48,8 @@
     Default: "Entra Sync Errors"
 
 .PARAMETER OutputPath
-    Local directory for CSV and log output.
+    Base directory for output. Reports are written to {OutputPath}\reports\ and logs to
+    {OutputPath}\logs\. Both subdirectories are created automatically if they do not exist.
     Default: Directory of this script (or current working directory if run from console).
 
 .PARAMETER SkipSharePointUpload
@@ -95,7 +96,8 @@
         OrgContact.Read.All
 
     SharePoint Permissions (App Registration):
-        Sites.ReadWrite.All  OR  Sites.Selected (scoped to target site)
+        SharePoint API (Application): Sites.Selected
+        Then grant site-level access: Grant-PnPAzureADAppSitePermission -AppId <ClientId> -DisplayName <Name> -Site <SiteUrl> -Permissions Manage
 
     Task Scheduler command:
         pwsh.exe -NonInteractive -File "C:\Scripts\Get-EntraSyncErrorUsers.ps1"
@@ -141,8 +143,13 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     $OutputPath = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 }
 
-if (-not (Test-Path -Path $OutputPath -PathType Container)) {
-    New-Item -Path $OutputPath -ItemType Directory -Force | Out-Null
+$reportsPath = Join-Path -Path $OutputPath -ChildPath "reports"
+$logsPath    = Join-Path -Path $OutputPath -ChildPath "logs"
+
+foreach ($dir in @($reportsPath, $logsPath)) {
+    if (-not (Test-Path -Path $dir -PathType Container)) {
+        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    }
 }
 
 $scriptStartTime = Get-Date
@@ -151,8 +158,8 @@ $timestamp        = $scriptStartTime.ToString("yyyyMMdd_HHmmss")
 $yearFolder       = $scriptStartTime.ToString("yyyy")
 $monthFolder      = $scriptStartTime.ToString("MMM")
 
-$logFile = Join-Path -Path $OutputPath -ChildPath "Get-EntraSyncErrorUsers_$timestamp.log"
-$csvFile = Join-Path -Path $OutputPath -ChildPath "EntraSyncErrors_$datestamp.csv"
+$logFile = Join-Path -Path $logsPath    -ChildPath "Get-EntraSyncErrorUsers_$timestamp.log"
+$csvFile = Join-Path -Path $reportsPath -ChildPath "EntraSyncErrors_$datestamp.csv"
 
 #endregion
 
@@ -278,7 +285,8 @@ function Assert-RequiredModule {
 
 Write-Log -Message "=== Get-EntraSyncErrorUsers Started ==="
 Write-Log -Message "Start Time : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
-Write-Log -Message "Output Path: $OutputPath"
+Write-Log -Message "Reports Path: $reportsPath"
+Write-Log -Message "Logs Path   : $logsPath"
 
 if (-not $SkipSharePointUpload) {
     if ([string]::IsNullOrWhiteSpace($SharePointSiteUrl)) {
@@ -481,19 +489,43 @@ if (-not $SkipSharePointUpload) {
     }
 
     try {
-        # Build folder path: {Library}/{BasePath}/{YYYY}/{MMM}
-        $sharePointFolderPath = "$SharePointDocumentLibrary/$SharePointBaseFolderPath/$yearFolder/$monthFolder"
-        Write-Log -Message "Ensuring SharePoint folder exists: $sharePointFolderPath"
+        # Build folder hierarchy one level at a time via REST (avoids CSOM, which is
+        # incompatible with Sites.Selected app-only auth).
+        # Resolve the library root URL from SharePoint directly — avoids guessing the
+        # server-relative URL, which may differ from the display/parameter name.
+        $library     = Get-PnPList -Identity $SharePointDocumentLibrary -Includes RootFolder -ErrorAction Stop
+        $currentPath = $library.RootFolder.ServerRelativeUrl.TrimEnd('/')
+        Write-Log -Message "Library root: $currentPath"
 
-        # Resolve-PnPFolder creates the full folder hierarchy if it doesn't exist
-        $targetFolder = Resolve-PnPFolder -SiteRelativePath $sharePointFolderPath
+        # Split base path into individual segments so multi-level paths (e.g. "Reports/Entra Sync Errors")
+        # are created one folder at a time. Filter empty strings caused by leading/trailing slashes.
+        $baseSegments   = $SharePointBaseFolderPath.Split('/') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        $folderSegments = @($baseSegments) + @($yearFolder, $monthFolder)
+
+        foreach ($segment in $folderSegments) {
+            try {
+                Add-PnPFolder -Name $segment -Folder $currentPath -ErrorAction Stop | Out-Null
+                Write-Log -Message "Created SharePoint folder: $currentPath/$segment"
+            }
+            catch {
+                if ($_.Exception.Message -match "already exist|SPException") {
+                    # Folder already exists — continue
+                }
+                else {
+                    Write-Log -Message "Could not create folder '$segment' under '$currentPath': $_" -Level Warning
+                }
+            }
+            $currentPath = "$currentPath/$segment"
+        }
+
+        Write-Log -Message "Target SharePoint folder: $currentPath"
 
         $csvFileName = Split-Path -Path $csvFile -Leaf
         Write-Log -Message "Uploading '$csvFileName' to SharePoint..."
 
-        Add-PnPFile -Path $csvFile -Folder $targetFolder.ServerRelativeUrl | Out-Null
+        Add-PnPFile -Path $csvFile -Folder $currentPath | Out-Null
 
-        Write-Log -Message "Upload successful. SharePoint path: $sharePointFolderPath/$csvFileName"
+        Write-Log -Message "Upload successful. SharePoint path: $currentPath/$csvFileName"
     }
     catch {
         Write-Log -Message "Failed to upload file to SharePoint: $_" -Level Error
