@@ -1,24 +1,20 @@
-#Requires -Modules Microsoft.Graph
+#Requires -Modules Microsoft.Graph.Reports, Microsoft.Graph.Users
 <#
 .SYNOPSIS
     Retrieves Microsoft Teams login activity for users in a specified office location over the past 30 days.
 
 .DESCRIPTION
     Connects to Microsoft Graph, downloads the Teams user activity report (D30),
-    filters users by the specified office location, cross-references both data sets,
-    and exports matching results to a CSV file on the Desktop.
+    filters by office location, and exports matching active users to a CSV file.
 
 .PARAMETER OfficeLocation
     The office location value to filter users by (e.g., "SCO", "New York").
 
 .PARAMETER OutputPath
-    Optional. Directory to save the output CSV. Defaults to the current user's Desktop.
+    Full file path for the output CSV (e.g., "~/Desktop/TFY-Teams.csv").
 
 .EXAMPLE
-    .\Get-TeamsLoginLog.ps1 -OfficeLocation "SCO"
-
-.EXAMPLE
-    .\Get-TeamsLoginLog.ps1 -OfficeLocation "New York" -OutputPath "C:\Reports"
+    .\Get-TeamsLoginLog.ps1 -OfficeLocation "SCO" -OutputPath "~/Desktop/SCO-Teams.csv"
 
 .NOTES
     Author      : Michael
@@ -29,16 +25,17 @@
 
 [CmdletBinding()]
 param (
-    [Parameter(Mandatory = $true, HelpMessage = "Enter the office location to filter users (e.g. 'SCO')")]
+    [Parameter(Mandatory = $true)]
     [string]$OfficeLocation,
 
-    [Parameter(Mandatory = $false)]
-    [string]$OutputPath = [System.Environment]::GetFolderPath('Desktop')
+    [Parameter(Mandatory = $true)]
+    [string]$OutputPath
 )
 
-#region --- Logging Helper ---
-
-$logFile = Join-Path $PSScriptRoot "Get-TeamsLoginLog_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+# --- Logging ---
+$logDir  = Join-Path $PSScriptRoot "logs"
+if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+$logFile = Join-Path $logDir "Get-TeamsLoginLog_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
 function Write-Log {
     param (
@@ -46,12 +43,8 @@ function Write-Log {
         [ValidateSet('Info', 'Warning', 'Error')]
         [string]$Level = 'Info'
     )
-
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $entry = "[$timestamp] [$Level] $Message"
-
+    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
     Add-Content -Path $logFile -Value $entry
-
     switch ($Level) {
         'Info'    { Write-Host $entry -ForegroundColor Green }
         'Warning' { Write-Host $entry -ForegroundColor Yellow }
@@ -59,142 +52,98 @@ function Write-Log {
     }
 }
 
-#endregion
-
-#region --- Validate Output Path ---
-
-if (-not (Test-Path $OutputPath)) {
-    Write-Log "Output path '$OutputPath' does not exist." -Level Error
+# --- Validate output path ---
+$OutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
+if (-not (Test-Path (Split-Path $OutputPath -Parent))) {
+    Write-Log "Output directory '$(Split-Path $OutputPath -Parent)' does not exist." -Level Error
     return
 }
 
-#endregion
+# --- Connect to Microsoft Graph ---
+$connected = $false
+if (Get-MgContext) {
+    Write-Log "Using existing Microsoft Graph session ($((Get-MgContext).Account))."
+} else {
+    try {
+        Write-Log "Connecting to Microsoft Graph..."
+        Connect-MgGraph -NoWelcome -Scopes "Reports.Read.All", "User.Read.All" -ErrorAction Stop
+        $connected = $true
+        Write-Log "Connected successfully."
+    } catch {
+        Write-Log "Failed to connect to Microsoft Graph: $_" -Level Error
+        return
+    }
+}
 
-#region --- Connect to Microsoft Graph ---
+# --- Main ---
+$tempReport = Join-Path $PSScriptRoot ".tmp_TeamsActivity_$(Get-Date -Format 'yyyyMMddHHmmss').csv"
 
 try {
-    Write-Log "Connecting to Microsoft Graph..."
-    Connect-MgGraph -Scopes "Reports.Read.All", "User.Read.All" -NoWelcome -ErrorAction Stop
-    Write-Log "Connected successfully."
-}
-catch {
-    Write-Log "Failed to connect to Microsoft Graph: $_" -Level Error
-    throw
-}
+    # Download Teams activity report
+    # Note: Get-MgReportTeamUserActivityUserDetail -OutFile throws ProgressRecord.PercentComplete
+    # ArgumentOutOfRangeException (Int32.MaxValue) when response lacks Content-Length — Graph SDK bug.
+    # Invoke-MgGraphRequest uses a different download path that avoids this.
+    Write-Log "Downloading Teams user activity report (D30)..."
+    Invoke-MgGraphRequest `
+        -Uri "https://graph.microsoft.com/v1.0/reports/getTeamsUserActivityUserDetail(period='D30')" `
+        -OutputFilePath $tempReport `
+        -ErrorAction Stop
+    Write-Log "Report downloaded."
 
-#endregion
+    # Get users by office location
+    Write-Log "Retrieving users with office location '$OfficeLocation'..."
+    $escapedLocation = $OfficeLocation -replace "'", "''"
+    $targetUsers = @(Get-MgUser `
+        -Filter "officeLocation eq '$escapedLocation'" `
+        -All `
+        -ConsistencyLevel eventual `
+        -CountVariable userCount `
+        -Property "Id,DisplayName,UserPrincipalName,OfficeLocation" `
+        -ErrorAction Stop |
+        Select-Object DisplayName, UserPrincipalName)
 
-$tempReport = $null
-
-try {
-
-    #region --- Download Teams Activity Report ---
-
-    $tempReport = Join-Path $env:TEMP "TeamsActivity30Days_$(Get-Date -Format 'yyyyMMddHHmmss').csv"
-
-    try {
-        Write-Log "Downloading Teams user activity report for the past 30 days..."
-
-        # Suppress progress bar to avoid known SDK overflow bug
-        $ProgressPreference = 'SilentlyContinue'
-        Get-MgReportTeamUserActivityUserDetail -Period "D30" -OutFile $tempReport -ErrorAction Stop
+    if ($targetUsers.Count -eq 0) {
+        Write-Log "No users found with office location '$OfficeLocation'." -Level Warning
+        return
     }
-    catch {
-        Write-Log "Failed to download Teams activity report: $_" -Level Error
-        throw
-    }
-    finally {
-        $ProgressPreference = 'Continue'
-    }
+    Write-Log "Found $($targetUsers.Count) user(s)."
 
-    Write-Log "Report downloaded to: $tempReport"
+    # Cross-reference with activity report
+    $upnToName = @{}
+    $targetUsers | ForEach-Object { $upnToName[$_.UserPrincipalName] = $_.DisplayName }
 
-    #endregion
+    $results = @(Import-Csv -Path $tempReport | Where-Object {
+        $_."User Principal Name" -in $upnToName.Keys -and
+        $_."Last Activity Date" -ne ""
+    } | Select-Object `
+        @{ Name = 'Display Name';              Expression = { $upnToName[$_."User Principal Name"] } },
+        "User Principal Name",
+        "Last Activity Date",
+        "Is Licensed",
+        "Team Chat Message Count",
+        "Private Chat Message Count",
+        "Call Count",
+        "Meeting Count",
+        "Meetings Organized Count",
+        "Meetings Attended Count")
 
-    #region --- Get Users by Office Location ---
+    Write-Log "Matched $($results.Count) active record(s)."
 
-    try {
-        Write-Log "Retrieving users with office location: '$OfficeLocation'..."
+    # Export
+    $results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+    Write-Log "Results exported to: $OutputPath"
 
-        $targetUsers = Get-MgUser `
-            -Filter "officeLocation eq '$OfficeLocation'" `
-            -All `
-            -ConsistencyLevel eventual `
-            -CountVariable userCount `
-            -Property "Id,DisplayName,UserPrincipalName,OfficeLocation" `
-            -ErrorAction Stop |
-            Select-Object DisplayName, UserPrincipalName, OfficeLocation
-
-        if ($userCount -eq 0) {
-            Write-Log "No users found with office location '$OfficeLocation'. Exiting." -Level Warning
-            return
-        }
-
-        Write-Log "Found $userCount user(s) with office location '$OfficeLocation'."
-    }
-    catch {
-        Write-Log "Failed to retrieve users: $_" -Level Error
-        throw
-    }
-
-    #endregion
-
-    #region --- Cross-Reference and Filter ---
-
-    try {
-        Write-Log "Cross-referencing users with Teams activity data..."
-
-        $teamsActivity = Import-Csv -Path $tempReport
-        $targetUPNs    = $targetUsers.UserPrincipalName
-        $upnToName     = @{}
-        $targetUsers | ForEach-Object { $upnToName[$_.UserPrincipalName] = $_.DisplayName }
-
-        $results = $teamsActivity | Where-Object {
-            $_."User Principal Name" -in $targetUPNs
-        } | Select-Object `
-            @{ Name = 'Display Name'; Expression = { $upnToName[$_."User Principal Name"] } },
-            "User Principal Name",
-            "Last Activity Date",
-            "Is Licensed",
-            "Team Chat Message Count",
-            "Private Chat Message Count",
-            "Call Count",
-            "Meeting Count",
-            "Meetings Organized Count",
-            "Meetings Attended Count"
-
-        Write-Log "Matched $($results.Count) record(s) with Teams activity in the past 30 days."
-    }
-    catch {
-        Write-Log "Failed to process report data: $_" -Level Error
-        throw
-    }
-
-    #endregion
-
-    #region --- Export Results ---
-
-    try {
-        $outputFile = Join-Path $OutputPath "TeamsLoginLog_${OfficeLocation}_$(Get-Date -Format 'yyyyMMdd').csv"
-        $results | Export-Csv -Path $outputFile -NoTypeInformation -ErrorAction Stop
-        Write-Log "Results exported to: $outputFile"
-    }
-    catch {
-        Write-Log "Failed to export results: $_" -Level Error
-        throw
-    }
-
-    #endregion
-
-}
-finally {
-    if ($tempReport -and (Test-Path $tempReport)) {
+} catch {
+    Write-Log "Error: $_" -Level Error
+} finally {
+    if (Test-Path $tempReport) {
         Remove-Item $tempReport -Force
         Write-Log "Temporary report file removed."
     }
-
-    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
-    Write-Log "Disconnected from Microsoft Graph."
+    if ($connected) {
+        Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+        Write-Log "Disconnected from Microsoft Graph."
+    }
 }
 
-Write-Log "Script completed successfully."
+Write-Log "Script completed."

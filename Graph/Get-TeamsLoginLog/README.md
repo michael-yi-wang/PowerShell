@@ -9,7 +9,7 @@ A PowerShell script that retrieves Microsoft Teams user activity for the past 30
 - **Office location filtering** — targets only users assigned to a specific office location in Entra ID/Azure AD.
 - **30-day activity window** — downloads the full `D30` Teams user activity report via Microsoft Graph.
 - **Cross-reference** — matches activity records against the filtered user list by UPN.
-- **CSV export** — exports matched records to a timestamped CSV file.
+- **CSV export** — exports matched records to the caller-specified CSV path.
 - **Session logging** — colour-coded console logging (Info / Warning / Error) for clear run feedback.
 
 ---
@@ -46,11 +46,9 @@ The script uses **delegated (interactive) authentication** via `Connect-MgGraph`
 ## Usage
 
 ```powershell
-# Filter by office location code; output saved to Desktop
-.\Get-TeamsLoginLog.ps1 -OfficeLocation "SCO"
+.\Get-TeamsLoginLog.ps1 -OfficeLocation "SCO" -OutputPath "C:\Reports\SCO-Teams.csv"
 
-# Custom output path
-.\Get-TeamsLoginLog.ps1 -OfficeLocation "New York" -OutputPath "C:\Reports"
+.\Get-TeamsLoginLog.ps1 -OfficeLocation "New York" -OutputPath "~/Desktop/NewYork-Teams.csv"
 ```
 
 ### Parameters
@@ -58,31 +56,26 @@ The script uses **delegated (interactive) authentication** via `Connect-MgGraph`
 | Parameter | Mandatory | Default | Description |
 |---|---|---|---|
 | `OfficeLocation` | Yes | — | Office location value to filter users by (e.g. `SCO`, `New York`) |
-| `OutputPath` | No | Current user's Desktop | Directory where the output CSV is saved |
+| `OutputPath` | Yes | — | Full file path for the output CSV (e.g. `~/Desktop/report.csv`) |
 
 ---
 
 ## Output
 
-The script exports a CSV file to the specified output path (defaults to Desktop):
-
-```
-TeamsLoginLog_<OfficeLocation>_<yyyyMMdd>.csv
-```
-
-**Example:** `TeamsLoginLog_SCO_20260514.csv`
+The CSV is written to the exact path supplied via `-OutputPath`. No automatic naming is applied; include any desired date or location segment in the filename.
 
 ### CSV Columns
 
 | Column | Description |
 |---|---|
+| `Display Name` | Display name from Entra ID |
 | `User Principal Name` | UPN of the user |
 | `Last Activity Date` | Date of last recorded Teams activity |
 | `Is Licensed` | Whether the user has a Teams licence |
 | `Team Chat Message Count` | Number of team chat messages sent |
 | `Private Chat Message Count` | Number of private chat messages sent |
 | `Call Count` | Number of calls made |
-| `Meeting Count` | Total meetings (organised + attended) |
+| `Meeting Count` | Number of meetings as reported by Microsoft Graph |
 | `Meetings Organized Count` | Number of meetings organised by the user |
 | `Meetings Attended Count` | Number of meetings attended by the user |
 
@@ -110,6 +103,7 @@ TeamsLoginLog_<OfficeLocation>_<yyyyMMdd>.csv
 | Empty CSV | No users from that office location have Teams activity in the last 30 days | Confirm users are licensed and active; report may lag up to 48 hours |
 | Module not found | `Microsoft.Graph` not installed | Run `Install-Module Microsoft.Graph -Scope CurrentUser` |
 | Report download fails | Transient Graph API error | Re-run the script; if persistent, check Microsoft 365 service health |
+| `ProgressRecord.PercentComplete` / value `2147483647` error | Running an older version of this script that used `Get-MgReportTeamUserActivityUserDetail -OutFile` | Use the current version which calls `Invoke-MgGraphRequest` instead — this bypasses the Graph SDK progress reporting bug |
 
 ---
 
