@@ -445,11 +445,20 @@ function Invoke-SharePointUpload {
             $baseSegments   = $SharePointBaseFolderPath.Split('/') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
             $folderSegments = @($baseSegments) + @($fileInfo.LocationName, $YearFolder, $MonthFolder)
 
-            # Resolve-PnPFolder creates the full path in one call and handles existing folders natively,
-            # avoiding brittle exception-message matching that breaks across PnP versions and locales.
-            $siteRelPath = ($libraryRoot.TrimStart('/') + '/' + ($folderSegments -join '/'))
-            Resolve-PnPFolder -SiteRelativePath $siteRelPath | Out-Null
-            $targetFolder = $libraryRoot + '/' + ($folderSegments -join '/')
+            # Create each folder segment only if it does not already exist.
+            # Get-PnPFolder existence check avoids brittle exception-message matching.
+            $currentPath = $libraryRoot
+            foreach ($segment in $folderSegments) {
+                $folderUrl = "$currentPath/$segment"
+                try {
+                    Get-PnPFolder -Url $folderUrl -ErrorAction Stop | Out-Null
+                }
+                catch {
+                    Add-PnPFolder -Name $segment -Folder $currentPath -ErrorAction Stop | Out-Null
+                }
+                $currentPath = $folderUrl
+            }
+            $targetFolder = $currentPath
 
             Write-Log "Uploading '$($fileInfo.FileName)' to $targetFolder..."
             Add-PnPFile -Path $fileInfo.FilePath -Folder $targetFolder | Out-Null
