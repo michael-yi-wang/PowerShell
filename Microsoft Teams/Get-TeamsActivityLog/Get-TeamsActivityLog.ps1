@@ -90,7 +90,7 @@
 
 .NOTES
     Author  : Michael Wang
-    Version : 2.2.0
+    Version : 2.3.0
     Date    : 2026-05-16
 
     Required Microsoft Graph API Permissions (Application):
@@ -104,9 +104,8 @@
               -Site <SiteUrl> -Permissions Manage
 
     Required PowerShell Modules:
-        Microsoft.Graph.Authentication
-        Microsoft.Graph.Users
-        Microsoft.Graph.Reports           (Get-MgAuditLogSignIn, Get-MgAuditLogNonInteractiveUserSignIn)
+        Microsoft.Graph.Authentication    (Connect-MgGraph, Disconnect-MgGraph, Invoke-MgGraphRequest)
+        Microsoft.Graph.Users             (Get-MgUser)
         PnP.PowerShell                    (required unless -SkipSharePointUpload is specified)
 #>
 
@@ -176,8 +175,7 @@ $MobileOSList = @('iOS', 'Android', 'Windows Phone')
 
 $GraphModules = @(
     'Microsoft.Graph.Authentication',
-    'Microsoft.Graph.Users',
-    'Microsoft.Graph.Reports'
+    'Microsoft.Graph.Users'
 )
 
 #endregion
@@ -259,6 +257,7 @@ function Get-TeamsSignInData {
     # Use the stable well-known App ID for Microsoft Teams rather than appDisplayName,
     # which can silently return 0 results if the display name differs in the tenant.
     $odataFilter = "appId eq '1fec8e78-bce4-4aaf-ab1b-5451cc387264' and status/errorCode eq 0 and createdDateTime ge $startDate"
+    $selectFields = 'userId,createdDateTime,deviceDetail'
 
     $userDesktopLogin = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
     $userMobileLogin  = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
@@ -266,13 +265,13 @@ function Get-TeamsSignInData {
     $totalRecords = 0
     $stopwatch    = [System.Diagnostics.Stopwatch]::StartNew()
 
-    # Query both interactive and non-interactive using the isInteractive filter on the same cmdlet.
-    # Get-MgAuditLogNonInteractiveUserSignIn does not exist in all SDK versions; isInteractive
-    # is a supported filter property on /auditLogs/signIns across all v1.0 SDK releases.
-    # The dictionaries keep only the most recent login per user per platform across both sources.
+    # Interactive and non-interactive sign-ins live on separate REST endpoints.
+    # The PowerShell SDK cmdlet for non-interactive is absent in some SDK versions, so both
+    # sources are queried via Invoke-MgGraphRequest to avoid any cmdlet availability issue.
+    # The dictionaries keep only the most recent login per user per platform across both.
     $signInSources = @(
-        @{ Label = 'Interactive';     Filter = "$odataFilter and isInteractive eq true" }
-        @{ Label = 'Non-Interactive'; Filter = "$odataFilter and isInteractive eq false" }
+        @{ Label = 'Interactive';     Endpoint = 'auditLogs/signIns' }
+        @{ Label = 'Non-Interactive'; Endpoint = 'auditLogs/nonInteractiveUserSignIns' }
     )
 
     try {
@@ -280,46 +279,48 @@ function Get-TeamsSignInData {
             Write-Log "Querying $($source.Label) sign-in logs..."
             $sourceCount = 0
 
+            $encodedFilter = [uri]::EscapeDataString($odataFilter)
+            $uri = "https://graph.microsoft.com/v1.0/$($source.Endpoint)?`$filter=$encodedFilter&`$select=$selectFields&`$top=999"
+
             try {
-                Get-MgAuditLogSignIn `
-                    -Filter   $source.Filter `
-                    -Select   @('userId','createdDateTime','deviceDetail') `
-                    -All `
-                    -PageSize 999 |
-                ForEach-Object {
-                    $sourceCount++
-                    $totalRecords++
+                do {
+                    $response = Invoke-MgGraphRequest -Uri $uri -Method GET -OutputType PSObject -ErrorAction Stop
 
-                    if ($totalRecords % 500 -eq 0) {
-                        $elapsed = [math]::Round($stopwatch.Elapsed.TotalSeconds, 0)
-                        Write-Progress -Activity 'Processing Teams sign-in logs' `
-                            -Status "Records processed: $totalRecords (${elapsed}s elapsed)" -PercentComplete -1
-                        Write-Log "Processed $totalRecords sign-in records so far..."
-                    }
+                    foreach ($record in $response.value) {
+                        $sourceCount++
+                        $totalRecords++
 
-                    $userId = $_.UserId
-                    if ([string]::IsNullOrWhiteSpace($userId)) { return }
+                        if ($totalRecords % 500 -eq 0) {
+                            $elapsed = [math]::Round($stopwatch.Elapsed.TotalSeconds, 0)
+                            Write-Progress -Activity 'Processing Teams sign-in logs' `
+                                -Status "Records processed: $totalRecords (${elapsed}s elapsed)" -PercentComplete -1
+                            Write-Log "Processed $totalRecords sign-in records so far..."
+                        }
 
-                    $os = $_.DeviceDetail.OperatingSystem
-                    # Graph SDK returns CreatedDateTime as DateTime (no offset); force UTC so it compares
-                    # cleanly against the DateTimeOffset dictionary values.
-                    $loginTime = [System.DateTimeOffset]::new(
-                        [System.DateTime]::SpecifyKind($_.CreatedDateTime, [System.DateTimeKind]::Utc)
-                    )
-                    # Browser/web client sign-ins report no OS; treat as Desktop (web from a desktop).
-                    if ([string]::IsNullOrWhiteSpace($os)) { $os = 'Web' }
+                        $userId = $record.userId
+                        if ([string]::IsNullOrWhiteSpace($userId)) { continue }
 
-                    if ($os -in $MobileOSList) {
-                        if (-not $userMobileLogin.ContainsKey($userId) -or $loginTime -gt $userMobileLogin[$userId]) {
-                            $userMobileLogin[$userId] = $loginTime
+                        $os = $record.deviceDetail?.operatingSystem
+                        # REST response returns createdDateTime as an ISO 8601 string; DateTimeOffset.Parse
+                        # handles the Z suffix correctly and produces a UTC offset.
+                        $loginTime = [System.DateTimeOffset]::Parse($record.createdDateTime.ToString())
+                        # Browser/web client sign-ins report no OS; treat as Desktop (web from a desktop).
+                        if ([string]::IsNullOrWhiteSpace($os)) { $os = 'Web' }
+
+                        if ($os -in $MobileOSList) {
+                            if (-not $userMobileLogin.ContainsKey($userId) -or $loginTime -gt $userMobileLogin[$userId]) {
+                                $userMobileLogin[$userId] = $loginTime
+                            }
+                        }
+                        else {
+                            if (-not $userDesktopLogin.ContainsKey($userId) -or $loginTime -gt $userDesktopLogin[$userId]) {
+                                $userDesktopLogin[$userId] = $loginTime
+                            }
                         }
                     }
-                    else {
-                        if (-not $userDesktopLogin.ContainsKey($userId) -or $loginTime -gt $userDesktopLogin[$userId]) {
-                            $userDesktopLogin[$userId] = $loginTime
-                        }
-                    }
-                }
+
+                    $uri = if ($response.'@odata.nextLink') { $response.'@odata.nextLink' } else { $null }
+                } while ($uri)
             }
             catch {
                 Write-Log "Error while retrieving $($source.Label) sign-in logs: $_" -Level Error
@@ -502,7 +503,7 @@ function Invoke-SharePointUpload {
 
 #region Main
 
-Write-Log "=== Get-TeamsActivityLog v2.2.0 ==="
+Write-Log "=== Get-TeamsActivityLog v2.3.0 ==="
 Write-Log "Start Time : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
 Write-Log "Days Back  : $DaysBack"
 Write-Log "Report Dir : $ReportBaseDir"

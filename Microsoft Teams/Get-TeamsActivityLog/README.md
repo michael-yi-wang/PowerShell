@@ -79,9 +79,8 @@ Install-Module -Name PnP.PowerShell -Scope CurrentUser -Repository PSGallery
 
 | Module | Used For |
 |---|---|
-| `Microsoft.Graph.Authentication` | `Connect-MgGraph` / `Disconnect-MgGraph` |
+| `Microsoft.Graph.Authentication` | `Connect-MgGraph`, `Disconnect-MgGraph`, `Invoke-MgGraphRequest` |
 | `Microsoft.Graph.Users` | `Get-MgUser` |
-| `Microsoft.Graph.Reports` | `Get-MgAuditLogSignIn`, `Get-MgAuditLogNonInteractiveUserSignIn` |
 | `PnP.PowerShell` | SharePoint Online upload (skipped with `-SkipSharePointUpload`) |
 
 ### 3. Entra ID App Registration
