@@ -8,6 +8,10 @@
     Connects to Microsoft Graph (app-only or interactive) and retrieves Teams sign-in activity
     from Entra ID audit logs for all active, non-guest users in the tenant.
 
+    Both interactive (credential prompt) and non-interactive (saved credentials / silent token
+    refresh) sign-ins are included so that users who launch Teams with saved credentials are
+    correctly reflected in the report.
+
     Desktop vs Mobile classification is based on the sign-in device operating system:
       - Mobile  : iOS, Android, Windows Phone
       - Desktop : Windows, macOS, Linux, ChromeOS, and any sign-in with no OS reported
@@ -86,12 +90,12 @@
 
 .NOTES
     Author  : Michael Wang
-    Version : 2.1.0
+    Version : 2.2.0
     Date    : 2026-05-16
 
     Required Microsoft Graph API Permissions (Application):
         User.Read.All
-        AuditLog.Read.All
+        AuditLog.Read.All                (covers both interactive and non-interactive sign-in logs)
 
     SharePoint Permissions (when -SkipSharePointUpload is NOT specified):
         SharePoint API (Application): Sites.Selected
@@ -102,7 +106,7 @@
     Required PowerShell Modules:
         Microsoft.Graph.Authentication
         Microsoft.Graph.Users
-        Microsoft.Graph.Identity.SignIns
+        Microsoft.Graph.Reports           (Get-MgAuditLogSignIn, Get-MgAuditLogNonInteractiveUserSignIn)
         PnP.PowerShell                    (required unless -SkipSharePointUpload is specified)
 #>
 
@@ -173,7 +177,7 @@ $MobileOSList = @('iOS', 'Android', 'Windows Phone')
 $GraphModules = @(
     'Microsoft.Graph.Authentication',
     'Microsoft.Graph.Users',
-    'Microsoft.Graph.Identity.SignIns'
+    'Microsoft.Graph.Reports'
 )
 
 #endregion
@@ -248,7 +252,7 @@ function Get-TeamsSignInData {
     [CmdletBinding()]
     param ([int]$DaysBack)
 
-    Write-Log "Querying Teams sign-in logs for the last $DaysBack day(s). This may take a while..."
+    Write-Log "Querying Teams sign-in logs (interactive + non-interactive) for the last $DaysBack day(s). This may take a while..."
 
     # $startDate derives from Get-Date only — no user input reaches this filter.
     $startDate   = (Get-Date).ToUniversalTime().AddDays(-$DaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -259,59 +263,76 @@ function Get-TeamsSignInData {
     $userDesktopLogin = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
     $userMobileLogin  = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
 
-    $recordCount = 0
-    $stopwatch   = [System.Diagnostics.Stopwatch]::StartNew()
+    $totalRecords = 0
+    $stopwatch    = [System.Diagnostics.Stopwatch]::StartNew()
+
+    # Both sources share the same filter and processing logic.
+    # The dictionaries keep only the most recent login per user per platform across both.
+    $signInSources = @(
+        @{ Label = 'Interactive';     Cmdlet = 'Get-MgAuditLogSignIn' }
+        @{ Label = 'Non-Interactive'; Cmdlet = 'Get-MgAuditLogNonInteractiveUserSignIn' }
+    )
 
     try {
-        Get-MgAuditLogSignIn `
-            -Filter   $odataFilter `
-            -Select   @('userId','createdDateTime','deviceDetail') `
-            -All `
-            -PageSize 999 |
-        ForEach-Object {
-            $recordCount++
+        foreach ($source in $signInSources) {
+            Write-Log "Querying $($source.Label) sign-in logs..."
+            $sourceCount = 0
 
-            if ($recordCount % 500 -eq 0) {
-                $elapsed = [math]::Round($stopwatch.Elapsed.TotalSeconds, 0)
-                Write-Progress -Activity 'Processing Teams sign-in logs' `
-                    -Status "Records processed: $recordCount (${elapsed}s elapsed)" -PercentComplete -1
-                Write-Log "Processed $recordCount sign-in records so far..."
-            }
+            try {
+                & $source.Cmdlet `
+                    -Filter   $odataFilter `
+                    -Select   @('userId','createdDateTime','deviceDetail') `
+                    -All `
+                    -PageSize 999 |
+                ForEach-Object {
+                    $sourceCount++
+                    $totalRecords++
 
-            $userId = $_.UserId
-            if ([string]::IsNullOrWhiteSpace($userId)) { return }
+                    if ($totalRecords % 500 -eq 0) {
+                        $elapsed = [math]::Round($stopwatch.Elapsed.TotalSeconds, 0)
+                        Write-Progress -Activity 'Processing Teams sign-in logs' `
+                            -Status "Records processed: $totalRecords (${elapsed}s elapsed)" -PercentComplete -1
+                        Write-Log "Processed $totalRecords sign-in records so far..."
+                    }
 
-            $os = $_.DeviceDetail.OperatingSystem
-            # Graph SDK returns CreatedDateTime as DateTime (no offset); force UTC so it compares
-            # cleanly against the DateTimeOffset dictionary values.
-            $loginTime = [System.DateTimeOffset]::new(
-                [System.DateTime]::SpecifyKind($_.CreatedDateTime, [System.DateTimeKind]::Utc)
-            )
-            # Browser/web client sign-ins report no OS; treat as Desktop (web from a desktop).
-            if ([string]::IsNullOrWhiteSpace($os)) { $os = 'Web' }
+                    $userId = $_.UserId
+                    if ([string]::IsNullOrWhiteSpace($userId)) { return }
 
-            if ($os -in $MobileOSList) {
-                if (-not $userMobileLogin.ContainsKey($userId) -or $loginTime -gt $userMobileLogin[$userId]) {
-                    $userMobileLogin[$userId] = $loginTime
+                    $os = $_.DeviceDetail.OperatingSystem
+                    # Graph SDK returns CreatedDateTime as DateTime (no offset); force UTC so it compares
+                    # cleanly against the DateTimeOffset dictionary values.
+                    $loginTime = [System.DateTimeOffset]::new(
+                        [System.DateTime]::SpecifyKind($_.CreatedDateTime, [System.DateTimeKind]::Utc)
+                    )
+                    # Browser/web client sign-ins report no OS; treat as Desktop (web from a desktop).
+                    if ([string]::IsNullOrWhiteSpace($os)) { $os = 'Web' }
+
+                    if ($os -in $MobileOSList) {
+                        if (-not $userMobileLogin.ContainsKey($userId) -or $loginTime -gt $userMobileLogin[$userId]) {
+                            $userMobileLogin[$userId] = $loginTime
+                        }
+                    }
+                    else {
+                        if (-not $userDesktopLogin.ContainsKey($userId) -or $loginTime -gt $userDesktopLogin[$userId]) {
+                            $userDesktopLogin[$userId] = $loginTime
+                        }
+                    }
                 }
             }
-            else {
-                if (-not $userDesktopLogin.ContainsKey($userId) -or $loginTime -gt $userDesktopLogin[$userId]) {
-                    $userDesktopLogin[$userId] = $loginTime
-                }
+            catch {
+                Write-Log "Error while retrieving $($source.Label) sign-in logs: $_" -Level Error
+                throw
             }
+
+            Write-Log "$($source.Label) sign-in log query complete. Records: $sourceCount."
         }
-    }
-    catch {
-        Write-Log "Error while retrieving sign-in logs: $_" -Level Error
-        throw
     }
     finally {
         Write-Progress -Activity 'Processing Teams sign-in logs' -Completed
         $stopwatch.Stop()
     }
 
-    Write-Log "Sign-in log processing complete. Total records: $recordCount."
+    Write-Log "Total sign-in records processed: $totalRecords."
     Write-Log "Users with Teams Desktop activity : $($userDesktopLogin.Count)"
     Write-Log "Users with Teams Mobile activity  : $($userMobileLogin.Count)"
 
@@ -445,11 +466,20 @@ function Invoke-SharePointUpload {
             $baseSegments   = $SharePointBaseFolderPath.Split('/') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
             $folderSegments = @($baseSegments) + @($fileInfo.LocationName, $YearFolder, $MonthFolder)
 
-            # Resolve-PnPFolder creates the full path in one call and handles existing folders natively,
-            # avoiding brittle exception-message matching that breaks across PnP versions and locales.
-            $siteRelPath = ($libraryRoot.TrimStart('/') + '/' + ($folderSegments -join '/'))
-            Resolve-PnPFolder -SiteRelativeUrl $siteRelPath | Out-Null
-            $targetFolder = $libraryRoot + '/' + ($folderSegments -join '/')
+            # Create each folder segment only if it does not already exist.
+            # Get-PnPFolder existence check avoids brittle exception-message matching.
+            $currentPath = $libraryRoot
+            foreach ($segment in $folderSegments) {
+                $folderUrl = "$currentPath/$segment"
+                try {
+                    Get-PnPFolder -Url $folderUrl -ErrorAction Stop | Out-Null
+                }
+                catch {
+                    Add-PnPFolder -Name $segment -Folder $currentPath -ErrorAction Stop | Out-Null
+                }
+                $currentPath = $folderUrl
+            }
+            $targetFolder = $currentPath
 
             Write-Log "Uploading '$($fileInfo.FileName)' to $targetFolder..."
             Add-PnPFile -Path $fileInfo.FilePath -Folder $targetFolder | Out-Null
@@ -470,7 +500,7 @@ function Invoke-SharePointUpload {
 
 #region Main
 
-Write-Log "=== Get-TeamsActivityLog v2.1.0 ==="
+Write-Log "=== Get-TeamsActivityLog v2.2.0 ==="
 Write-Log "Start Time : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
 Write-Log "Days Back  : $DaysBack"
 Write-Log "Report Dir : $ReportBaseDir"

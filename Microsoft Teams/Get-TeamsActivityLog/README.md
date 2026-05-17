@@ -2,6 +2,8 @@
 
 A PowerShell 7 script that retrieves the last Microsoft Teams Desktop and Mobile sign-in time for all active users in a Microsoft 365 tenant, grouped by Office Location, with optional upload to SharePoint Online.
 
+Both **interactive** (credential prompt / MFA) and **non-interactive** (saved credentials / silent token refresh) sign-ins are captured, so users who simply launch Teams without being re-prompted are correctly reflected in the report.
+
 ---
 
 ## How It Works
@@ -9,7 +11,7 @@ A PowerShell 7 script that retrieves the last Microsoft Teams Desktop and Mobile
 The script connects to Microsoft Graph (app-only or interactive) and:
 
 1. Enumerates all **enabled, non-guest member accounts** from Entra ID.
-2. Queries the **Entra ID sign-in audit logs** for successful Microsoft Teams authentications within the specified lookback window (default: 30 days).
+2. Queries **both interactive and non-interactive Entra ID sign-in audit logs** for successful Microsoft Teams authentications within the specified lookback window (default: 30 days). The most recent timestamp across both sources is used per user per platform.
 3. Classifies each sign-in as **Desktop** or **Mobile** based on the device operating system:
    - **Mobile**: iOS, Android, Windows Phone
    - **Desktop**: Windows, macOS, Linux, ChromeOS, and all other non-empty OS values
@@ -79,7 +81,7 @@ Install-Module -Name PnP.PowerShell -Scope CurrentUser -Repository PSGallery
 |---|---|
 | `Microsoft.Graph.Authentication` | `Connect-MgGraph` / `Disconnect-MgGraph` |
 | `Microsoft.Graph.Users` | `Get-MgUser` |
-| `Microsoft.Graph.Identity.SignIns` | `Get-MgAuditLogSignIn` |
+| `Microsoft.Graph.Reports` | `Get-MgAuditLogSignIn`, `Get-MgAuditLogNonInteractiveUserSignIn` |
 | `PnP.PowerShell` | SharePoint Online upload (skipped with `-SkipSharePointUpload`) |
 
 ### 3. Entra ID App Registration
