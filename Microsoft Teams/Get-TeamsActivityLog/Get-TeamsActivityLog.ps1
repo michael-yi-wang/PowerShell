@@ -90,7 +90,7 @@
 
 .NOTES
     Author  : Michael Wang
-    Version : 2.3.0
+    Version : 2.4.0
     Date    : 2026-05-16
 
     Required Microsoft Graph API Permissions (Application):
@@ -259,19 +259,21 @@ function Get-TeamsSignInData {
     $odataFilter = "appId eq '1fec8e78-bce4-4aaf-ab1b-5451cc387264' and status/errorCode eq 0 and createdDateTime ge $startDate"
     $selectFields = 'userId,createdDateTime,deviceDetail'
 
-    $userDesktopLogin = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
-    $userMobileLogin  = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
+    # Four separate dictionaries — one per platform per auth type — so the report
+    # shows interactive and non-interactive last logins as distinct columns.
+    $desktopInteractive    = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
+    $desktopNonInteractive = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
+    $mobileInteractive     = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
+    $mobileNonInteractive  = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
 
     $totalRecords = 0
     $stopwatch    = [System.Diagnostics.Stopwatch]::StartNew()
 
     # Interactive and non-interactive sign-ins live on separate REST endpoints.
-    # The PowerShell SDK cmdlet for non-interactive is absent in some SDK versions, so both
-    # sources are queried via Invoke-MgGraphRequest to avoid any cmdlet availability issue.
-    # The dictionaries keep only the most recent login per user per platform across both.
+    # Both are queried via Invoke-MgGraphRequest to avoid SDK cmdlet availability issues.
     $signInSources = @(
-        @{ Label = 'Interactive';     Endpoint = 'auditLogs/signIns' }
-        @{ Label = 'Non-Interactive'; Endpoint = 'auditLogs/nonInteractiveUserSignIns' }
+        @{ Label = 'Interactive';     Endpoint = 'auditLogs/signIns';                    DesktopDict = $desktopInteractive;    MobileDict = $mobileInteractive }
+        @{ Label = 'Non-Interactive'; Endpoint = 'auditLogs/nonInteractiveUserSignIns';  DesktopDict = $desktopNonInteractive; MobileDict = $mobileNonInteractive }
     )
 
     try {
@@ -308,13 +310,13 @@ function Get-TeamsSignInData {
                         if ([string]::IsNullOrWhiteSpace($os)) { $os = 'Web' }
 
                         if ($os -in $MobileOSList) {
-                            if (-not $userMobileLogin.ContainsKey($userId) -or $loginTime -gt $userMobileLogin[$userId]) {
-                                $userMobileLogin[$userId] = $loginTime
+                            if (-not $source.MobileDict.ContainsKey($userId) -or $loginTime -gt $source.MobileDict[$userId]) {
+                                $source.MobileDict[$userId] = $loginTime
                             }
                         }
                         else {
-                            if (-not $userDesktopLogin.ContainsKey($userId) -or $loginTime -gt $userDesktopLogin[$userId]) {
-                                $userDesktopLogin[$userId] = $loginTime
+                            if (-not $source.DesktopDict.ContainsKey($userId) -or $loginTime -gt $source.DesktopDict[$userId]) {
+                                $source.DesktopDict[$userId] = $loginTime
                             }
                         }
                     }
@@ -337,10 +339,17 @@ function Get-TeamsSignInData {
     }
 
     Write-Log "Total sign-in records processed: $totalRecords."
-    Write-Log "Users with Teams Desktop activity : $($userDesktopLogin.Count)"
-    Write-Log "Users with Teams Mobile activity  : $($userMobileLogin.Count)"
+    Write-Log "Users with Teams Desktop Interactive activity     : $($desktopInteractive.Count)"
+    Write-Log "Users with Teams Desktop Non-Interactive activity : $($desktopNonInteractive.Count)"
+    Write-Log "Users with Teams Mobile Interactive activity      : $($mobileInteractive.Count)"
+    Write-Log "Users with Teams Mobile Non-Interactive activity  : $($mobileNonInteractive.Count)"
 
-    return @{ Desktop = $userDesktopLogin; Mobile = $userMobileLogin }
+    return @{
+        DesktopInteractive    = $desktopInteractive
+        DesktopNonInteractive = $desktopNonInteractive
+        MobileInteractive     = $mobileInteractive
+        MobileNonInteractive  = $mobileNonInteractive
+    }
 }
 
 function Export-TeamsReports {
@@ -355,26 +364,25 @@ function Export-TeamsReports {
     $results = [System.Collections.Generic.List[PSCustomObject]]::new()
 
     foreach ($user in $Users) {
-        $desktopLogin = $null
-        $mobileLogin  = $null
+        $uid = $user.Id
 
-        if ($SignInData.Desktop.ContainsKey($user.Id)) {
-            $desktopLogin = $SignInData.Desktop[$user.Id].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss')
-        }
-        if ($SignInData.Mobile.ContainsKey($user.Id)) {
-            $mobileLogin = $SignInData.Mobile[$user.Id].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss')
-        }
+        $desktopI    = if ($SignInData.DesktopInteractive.ContainsKey($uid))    { $SignInData.DesktopInteractive[$uid].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') }    else { $null }
+        $desktopNI   = if ($SignInData.DesktopNonInteractive.ContainsKey($uid)) { $SignInData.DesktopNonInteractive[$uid].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
+        $mobileI     = if ($SignInData.MobileInteractive.ContainsKey($uid))     { $SignInData.MobileInteractive[$uid].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') }     else { $null }
+        $mobileNI    = if ($SignInData.MobileNonInteractive.ContainsKey($uid))  { $SignInData.MobileNonInteractive[$uid].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') }  else { $null }
 
         $results.Add([PSCustomObject]@{
-            DisplayName               = $user.DisplayName
-            Email                     = if ($user.Mail) { $user.Mail } else { $user.UserPrincipalName }
-            UserPrincipalName         = $user.UserPrincipalName
-            OfficeLocation            = $user.OfficeLocation
-            Department                = $user.Department
-            Title                     = $user.JobTitle
-            AccountEnabled            = $user.AccountEnabled
-            TeamsDesktopLastLogin_UTC = $desktopLogin
-            TeamsMobileLastLogin_UTC  = $mobileLogin
+            DisplayName                              = $user.DisplayName
+            Email                                    = if ($user.Mail) { $user.Mail } else { $user.UserPrincipalName }
+            UserPrincipalName                        = $user.UserPrincipalName
+            OfficeLocation                           = $user.OfficeLocation
+            Department                               = $user.Department
+            Title                                    = $user.JobTitle
+            AccountEnabled                           = $user.AccountEnabled
+            TeamsDesktopInteractiveLastLogin_UTC     = $desktopI
+            TeamsDesktopNonInteractiveLastLogin_UTC  = $desktopNI
+            TeamsMobileInteractiveLastLogin_UTC      = $mobileI
+            TeamsMobileNonInteractiveLastLogin_UTC   = $mobileNI
         })
     }
 
@@ -504,7 +512,7 @@ function Invoke-SharePointUpload {
 
 #region Main
 
-Write-Log "=== Get-TeamsActivityLog v2.3.0 ==="
+Write-Log "=== Get-TeamsActivityLog v2.4.0 ==="
 Write-Log "Start Time : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
 Write-Log "Days Back  : $DaysBack"
 Write-Log "Report Dir : $ReportBaseDir"

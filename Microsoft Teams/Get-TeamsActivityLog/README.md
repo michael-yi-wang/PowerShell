@@ -48,12 +48,14 @@ The script connects to Microsoft Graph (app-only or interactive) and:
 | `Department` | Department from Entra ID profile |
 | `Title` | Job title from Entra ID profile |
 | `AccountEnabled` | Whether the account is enabled in Entra ID |
-| `TeamsDesktopLastLogin_UTC` | Latest successful Teams Desktop/Web sign-in (UTC) |
-| `TeamsMobileLastLogin_UTC` | Latest successful Teams Mobile sign-in (UTC) |
+| `TeamsDesktopInteractiveLastLogin_UTC` | Latest Teams Desktop/Web **interactive** sign-in (UTC) |
+| `TeamsDesktopNonInteractiveLastLogin_UTC` | Latest Teams Desktop/Web **non-interactive** sign-in (UTC) |
+| `TeamsMobileInteractiveLastLogin_UTC` | Latest Teams Mobile **interactive** sign-in (UTC) |
+| `TeamsMobileNonInteractiveLastLogin_UTC` | Latest Teams Mobile **non-interactive** sign-in (UTC) |
 
 > **Timezone note:** All timestamps are in **UTC**. Browser-based (web client) sign-ins have no OS reported and are classified as Desktop.
 
-Empty `TeamsDesktopLastLogin_UTC` / `TeamsMobileLastLogin_UTC` cells mean the user had **no Teams activity** on that platform in the lookback period.
+Empty cells mean the user had **no activity** of that type on that platform in the lookback period.
 
 ---
 
