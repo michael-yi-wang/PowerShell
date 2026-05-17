@@ -266,11 +266,13 @@ function Get-TeamsSignInData {
     $totalRecords = 0
     $stopwatch    = [System.Diagnostics.Stopwatch]::StartNew()
 
-    # Both sources share the same filter and processing logic.
-    # The dictionaries keep only the most recent login per user per platform across both.
+    # Query both interactive and non-interactive using the isInteractive filter on the same cmdlet.
+    # Get-MgAuditLogNonInteractiveUserSignIn does not exist in all SDK versions; isInteractive
+    # is a supported filter property on /auditLogs/signIns across all v1.0 SDK releases.
+    # The dictionaries keep only the most recent login per user per platform across both sources.
     $signInSources = @(
-        @{ Label = 'Interactive';     Cmdlet = 'Get-MgAuditLogSignIn' }
-        @{ Label = 'Non-Interactive'; Cmdlet = 'Get-MgAuditLogNonInteractiveUserSignIn' }
+        @{ Label = 'Interactive';     Filter = "$odataFilter and isInteractive eq true" }
+        @{ Label = 'Non-Interactive'; Filter = "$odataFilter and isInteractive eq false" }
     )
 
     try {
@@ -279,8 +281,8 @@ function Get-TeamsSignInData {
             $sourceCount = 0
 
             try {
-                & $source.Cmdlet `
-                    -Filter   $odataFilter `
+                Get-MgAuditLogSignIn `
+                    -Filter   $source.Filter `
                     -Select   @('userId','createdDateTime','deviceDetail') `
                     -All `
                     -PageSize 999 |
