@@ -97,7 +97,7 @@
 
 .NOTES
     Author  : Michael Wang
-    Version : 2.5.1
+    Version : 2.5.2
     Date    : 2026-05-17
 
     Required Microsoft Graph API Permissions (Application):
@@ -289,8 +289,10 @@ function Get-TeamsSignInData {
     # Non-interactive sign-ins are filtered via signInEventTypes/any(t: t eq 'nonInteractiveUser').
     # Ref: https://learn.microsoft.com/entra/identity/monitoring-health/howto-analyze-activity-logs-with-microsoft-graph
     #
-    # Queries are split into 1-day chunks to prevent Graph skip-token expiry, which occurs
-    # when a single paginated session runs too long on large result sets.
+    # Queries are split into 6-hour chunks to prevent Graph skip-token expiry. The beta
+    # sign-in endpoint's skip token expires if a single paginated session runs too long;
+    # 6-hour windows keep each chunk's pagination well under that timeout even for large tenants.
+    $chunkHours = 6
     $signInSources = @(
         @{
             Label       = 'Interactive'
@@ -317,11 +319,12 @@ function Get-TeamsSignInData {
             $chunkStart  = $now.AddDays(-$source.DaysBack)
 
             while ($chunkStart -lt $now) {
-                $chunkEnd = $chunkStart.AddDays(1)
+                $chunkEnd = $chunkStart.AddHours($chunkHours)
                 if ($chunkEnd -gt $now) { $chunkEnd = $now }
 
                 $startStr    = $chunkStart.ToString("yyyy-MM-ddTHH:mm:ssZ")
                 $endStr      = $chunkEnd.ToString("yyyy-MM-ddTHH:mm:ssZ")
+                Write-Log "  [$($source.Label)] chunk $($chunkStart.ToString('yyyy-MM-dd HH:mm')) – $($chunkEnd.ToString('yyyy-MM-dd HH:mm')) UTC"
                 $chunkFilter = "$filterBase and createdDateTime ge $startStr and createdDateTime lt $endStr$($source.ExtraFilter)"
 
                 $encodedFilter = [uri]::EscapeDataString($chunkFilter)
@@ -558,7 +561,7 @@ function Invoke-SharePointUpload {
 
 #region Main
 
-Write-Log "=== Get-TeamsActivityLog v2.5.1 ==="
+Write-Log "=== Get-TeamsActivityLog v2.5.2 ==="
 Write-Log "Start Time      : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
 Write-Log "Days Back       : $DaysBack (interactive)"
 Write-Log "NI Days Back    : $NonInteractiveDaysBack (non-interactive)"
