@@ -256,7 +256,7 @@ function Get-TeamsSignInData {
     $startDate   = (Get-Date).ToUniversalTime().AddDays(-$DaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
     # Use the stable well-known App ID for Microsoft Teams rather than appDisplayName,
     # which can silently return 0 results if the display name differs in the tenant.
-    $odataFilter = "appId eq '1fec8e78-bce4-4aaf-ab1b-5451cc387264' and status/errorCode eq 0 and createdDateTime ge $startDate"
+    $baseFilter   = "appId eq '1fec8e78-bce4-4aaf-ab1b-5451cc387264' and status/errorCode eq 0 and createdDateTime ge $startDate"
     $selectFields = 'userId,createdDateTime,deviceDetail'
 
     # Four separate dictionaries — one per platform per auth type — so the report
@@ -269,12 +269,12 @@ function Get-TeamsSignInData {
     $totalRecords = 0
     $stopwatch    = [System.Diagnostics.Stopwatch]::StartNew()
 
-    # Interactive and non-interactive sign-ins live on separate REST endpoints.
-    # nonInteractiveUserSignIns is only available in the beta API, not v1.0.
-    # Both are queried via Invoke-MgGraphRequest to avoid SDK cmdlet availability issues.
+    # Both sign-in types use the /signIns endpoint (beta required for signInEventTypes filter).
+    # Non-interactive sign-ins are filtered via signInEventTypes/any(t: t eq 'nonInteractiveUser').
+    # Ref: https://learn.microsoft.com/entra/identity/monitoring-health/howto-analyze-activity-logs-with-microsoft-graph
     $signInSources = @(
-        @{ Label = 'Interactive';     BaseUri = 'https://graph.microsoft.com/v1.0/auditLogs/signIns';                   DesktopDict = $desktopInteractive;    MobileDict = $mobileInteractive }
-        @{ Label = 'Non-Interactive'; BaseUri = 'https://graph.microsoft.com/beta/auditLogs/nonInteractiveUserSignIns'; DesktopDict = $desktopNonInteractive; MobileDict = $mobileNonInteractive }
+        @{ Label = 'Interactive';     BaseUri = 'https://graph.microsoft.com/v1.0/auditLogs/signIns'; ODataFilter = $baseFilter;                                                                              DesktopDict = $desktopInteractive;    MobileDict = $mobileInteractive }
+        @{ Label = 'Non-Interactive'; BaseUri = 'https://graph.microsoft.com/beta/auditLogs/signIns'; ODataFilter = "$baseFilter and signInEventTypes/any(t: t eq 'nonInteractiveUser')"; DesktopDict = $desktopNonInteractive; MobileDict = $mobileNonInteractive }
     )
 
     try {
@@ -282,7 +282,7 @@ function Get-TeamsSignInData {
             Write-Log "Querying $($source.Label) sign-in logs..."
             $sourceCount = 0
 
-            $encodedFilter = [uri]::EscapeDataString($odataFilter)
+            $encodedFilter = [uri]::EscapeDataString($source.ODataFilter)
             $uri = "$($source.BaseUri)?`$filter=$encodedFilter&`$select=$selectFields&`$top=999"
 
             try {
