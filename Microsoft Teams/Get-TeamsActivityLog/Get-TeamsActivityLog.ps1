@@ -319,7 +319,8 @@ function Get-TeamsSignInData {
                         }
                     }
 
-                    $uri = if ($response.'@odata.nextLink') { $response.'@odata.nextLink' } else { $null }
+                    # PSObject.Properties lookup avoids strict-mode error when @odata.nextLink is absent on the last page.
+                    $uri = $response.PSObject.Properties['@odata.nextLink']?.Value
                 } while ($uri)
             }
             catch {
