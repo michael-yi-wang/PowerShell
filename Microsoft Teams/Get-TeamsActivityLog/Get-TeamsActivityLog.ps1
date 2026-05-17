@@ -90,7 +90,7 @@
 
 .NOTES
     Author  : Michael Wang
-    Version : 2.2.0
+    Version : 2.4.0
     Date    : 2026-05-16
 
     Required Microsoft Graph API Permissions (Application):
@@ -104,9 +104,8 @@
               -Site <SiteUrl> -Permissions Manage
 
     Required PowerShell Modules:
-        Microsoft.Graph.Authentication
-        Microsoft.Graph.Users
-        Microsoft.Graph.Reports           (Get-MgAuditLogSignIn, Get-MgAuditLogNonInteractiveUserSignIn)
+        Microsoft.Graph.Authentication    (Connect-MgGraph, Disconnect-MgGraph, Invoke-MgGraphRequest)
+        Microsoft.Graph.Users             (Get-MgUser)
         PnP.PowerShell                    (required unless -SkipSharePointUpload is specified)
 #>
 
@@ -176,8 +175,7 @@ $MobileOSList = @('iOS', 'Android', 'Windows Phone')
 
 $GraphModules = @(
     'Microsoft.Graph.Authentication',
-    'Microsoft.Graph.Users',
-    'Microsoft.Graph.Reports'
+    'Microsoft.Graph.Users'
 )
 
 #endregion
@@ -258,19 +256,25 @@ function Get-TeamsSignInData {
     $startDate   = (Get-Date).ToUniversalTime().AddDays(-$DaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
     # Use the stable well-known App ID for Microsoft Teams rather than appDisplayName,
     # which can silently return 0 results if the display name differs in the tenant.
-    $odataFilter = "appId eq '1fec8e78-bce4-4aaf-ab1b-5451cc387264' and status/errorCode eq 0 and createdDateTime ge $startDate"
+    $baseFilter   = "appId eq '1fec8e78-bce4-4aaf-ab1b-5451cc387264' and status/errorCode eq 0 and createdDateTime ge $startDate"
+    $selectFields = 'userId,createdDateTime,deviceDetail'
 
-    $userDesktopLogin = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
-    $userMobileLogin  = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
+    # Four separate dictionaries — one per platform per auth type — so the report
+    # shows interactive and non-interactive last logins as distinct columns.
+    $desktopInteractive    = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
+    $desktopNonInteractive = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
+    $mobileInteractive     = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
+    $mobileNonInteractive  = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
 
     $totalRecords = 0
     $stopwatch    = [System.Diagnostics.Stopwatch]::StartNew()
 
-    # Both sources share the same filter and processing logic.
-    # The dictionaries keep only the most recent login per user per platform across both.
+    # Both sign-in types use the /signIns endpoint (beta required for signInEventTypes filter).
+    # Non-interactive sign-ins are filtered via signInEventTypes/any(t: t eq 'nonInteractiveUser').
+    # Ref: https://learn.microsoft.com/entra/identity/monitoring-health/howto-analyze-activity-logs-with-microsoft-graph
     $signInSources = @(
-        @{ Label = 'Interactive';     Cmdlet = 'Get-MgAuditLogSignIn' }
-        @{ Label = 'Non-Interactive'; Cmdlet = 'Get-MgAuditLogNonInteractiveUserSignIn' }
+        @{ Label = 'Interactive';     BaseUri = 'https://graph.microsoft.com/v1.0/auditLogs/signIns'; ODataFilter = $baseFilter;                                                                              DesktopDict = $desktopInteractive;    MobileDict = $mobileInteractive }
+        @{ Label = 'Non-Interactive'; BaseUri = 'https://graph.microsoft.com/beta/auditLogs/signIns'; ODataFilter = "$baseFilter and signInEventTypes/any(t: t eq 'nonInteractiveUser')"; DesktopDict = $desktopNonInteractive; MobileDict = $mobileNonInteractive }
     )
 
     try {
@@ -278,46 +282,49 @@ function Get-TeamsSignInData {
             Write-Log "Querying $($source.Label) sign-in logs..."
             $sourceCount = 0
 
+            $encodedFilter = [uri]::EscapeDataString($source.ODataFilter)
+            $uri = "$($source.BaseUri)?`$filter=$encodedFilter&`$select=$selectFields&`$top=999"
+
             try {
-                & $source.Cmdlet `
-                    -Filter   $odataFilter `
-                    -Select   @('userId','createdDateTime','deviceDetail') `
-                    -All `
-                    -PageSize 999 |
-                ForEach-Object {
-                    $sourceCount++
-                    $totalRecords++
+                do {
+                    $response = Invoke-MgGraphRequest -Uri $uri -Method GET -OutputType PSObject -ErrorAction Stop
 
-                    if ($totalRecords % 500 -eq 0) {
-                        $elapsed = [math]::Round($stopwatch.Elapsed.TotalSeconds, 0)
-                        Write-Progress -Activity 'Processing Teams sign-in logs' `
-                            -Status "Records processed: $totalRecords (${elapsed}s elapsed)" -PercentComplete -1
-                        Write-Log "Processed $totalRecords sign-in records so far..."
-                    }
+                    foreach ($record in $response.value) {
+                        $sourceCount++
+                        $totalRecords++
 
-                    $userId = $_.UserId
-                    if ([string]::IsNullOrWhiteSpace($userId)) { return }
+                        if ($totalRecords % 500 -eq 0) {
+                            $elapsed = [math]::Round($stopwatch.Elapsed.TotalSeconds, 0)
+                            Write-Progress -Activity 'Processing Teams sign-in logs' `
+                                -Status "Records processed: $totalRecords (${elapsed}s elapsed)" -PercentComplete -1
+                            Write-Log "Processed $totalRecords sign-in records so far..."
+                        }
 
-                    $os = $_.DeviceDetail.OperatingSystem
-                    # Graph SDK returns CreatedDateTime as DateTime (no offset); force UTC so it compares
-                    # cleanly against the DateTimeOffset dictionary values.
-                    $loginTime = [System.DateTimeOffset]::new(
-                        [System.DateTime]::SpecifyKind($_.CreatedDateTime, [System.DateTimeKind]::Utc)
-                    )
-                    # Browser/web client sign-ins report no OS; treat as Desktop (web from a desktop).
-                    if ([string]::IsNullOrWhiteSpace($os)) { $os = 'Web' }
+                        $userId = $record.userId
+                        if ([string]::IsNullOrWhiteSpace($userId)) { continue }
 
-                    if ($os -in $MobileOSList) {
-                        if (-not $userMobileLogin.ContainsKey($userId) -or $loginTime -gt $userMobileLogin[$userId]) {
-                            $userMobileLogin[$userId] = $loginTime
+                        $os = $record.deviceDetail?.operatingSystem
+                        # REST response returns createdDateTime as an ISO 8601 string; DateTimeOffset.Parse
+                        # handles the Z suffix correctly and produces a UTC offset.
+                        $loginTime = [System.DateTimeOffset]::Parse($record.createdDateTime.ToString())
+                        # Browser/web client sign-ins report no OS; treat as Desktop (web from a desktop).
+                        if ([string]::IsNullOrWhiteSpace($os)) { $os = 'Web' }
+
+                        if ($os -in $MobileOSList) {
+                            if (-not $source.MobileDict.ContainsKey($userId) -or $loginTime -gt $source.MobileDict[$userId]) {
+                                $source.MobileDict[$userId] = $loginTime
+                            }
+                        }
+                        else {
+                            if (-not $source.DesktopDict.ContainsKey($userId) -or $loginTime -gt $source.DesktopDict[$userId]) {
+                                $source.DesktopDict[$userId] = $loginTime
+                            }
                         }
                     }
-                    else {
-                        if (-not $userDesktopLogin.ContainsKey($userId) -or $loginTime -gt $userDesktopLogin[$userId]) {
-                            $userDesktopLogin[$userId] = $loginTime
-                        }
-                    }
-                }
+
+                    # PSObject.Properties lookup avoids strict-mode error when @odata.nextLink is absent on the last page.
+                    $uri = $response.PSObject.Properties['@odata.nextLink']?.Value
+                } while ($uri)
             }
             catch {
                 Write-Log "Error while retrieving $($source.Label) sign-in logs: $_" -Level Error
@@ -333,10 +340,17 @@ function Get-TeamsSignInData {
     }
 
     Write-Log "Total sign-in records processed: $totalRecords."
-    Write-Log "Users with Teams Desktop activity : $($userDesktopLogin.Count)"
-    Write-Log "Users with Teams Mobile activity  : $($userMobileLogin.Count)"
+    Write-Log "Users with Teams Desktop Interactive activity     : $($desktopInteractive.Count)"
+    Write-Log "Users with Teams Desktop Non-Interactive activity : $($desktopNonInteractive.Count)"
+    Write-Log "Users with Teams Mobile Interactive activity      : $($mobileInteractive.Count)"
+    Write-Log "Users with Teams Mobile Non-Interactive activity  : $($mobileNonInteractive.Count)"
 
-    return @{ Desktop = $userDesktopLogin; Mobile = $userMobileLogin }
+    return @{
+        DesktopInteractive    = $desktopInteractive
+        DesktopNonInteractive = $desktopNonInteractive
+        MobileInteractive     = $mobileInteractive
+        MobileNonInteractive  = $mobileNonInteractive
+    }
 }
 
 function Export-TeamsReports {
@@ -351,26 +365,25 @@ function Export-TeamsReports {
     $results = [System.Collections.Generic.List[PSCustomObject]]::new()
 
     foreach ($user in $Users) {
-        $desktopLogin = $null
-        $mobileLogin  = $null
+        $uid = $user.Id
 
-        if ($SignInData.Desktop.ContainsKey($user.Id)) {
-            $desktopLogin = $SignInData.Desktop[$user.Id].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss')
-        }
-        if ($SignInData.Mobile.ContainsKey($user.Id)) {
-            $mobileLogin = $SignInData.Mobile[$user.Id].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss')
-        }
+        $desktopI    = if ($SignInData.DesktopInteractive.ContainsKey($uid))    { $SignInData.DesktopInteractive[$uid].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') }    else { $null }
+        $desktopNI   = if ($SignInData.DesktopNonInteractive.ContainsKey($uid)) { $SignInData.DesktopNonInteractive[$uid].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
+        $mobileI     = if ($SignInData.MobileInteractive.ContainsKey($uid))     { $SignInData.MobileInteractive[$uid].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') }     else { $null }
+        $mobileNI    = if ($SignInData.MobileNonInteractive.ContainsKey($uid))  { $SignInData.MobileNonInteractive[$uid].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') }  else { $null }
 
         $results.Add([PSCustomObject]@{
-            DisplayName               = $user.DisplayName
-            Email                     = if ($user.Mail) { $user.Mail } else { $user.UserPrincipalName }
-            UserPrincipalName         = $user.UserPrincipalName
-            OfficeLocation            = $user.OfficeLocation
-            Department                = $user.Department
-            Title                     = $user.JobTitle
-            AccountEnabled            = $user.AccountEnabled
-            TeamsDesktopLastLogin_UTC = $desktopLogin
-            TeamsMobileLastLogin_UTC  = $mobileLogin
+            DisplayName                              = $user.DisplayName
+            Email                                    = if ($user.Mail) { $user.Mail } else { $user.UserPrincipalName }
+            UserPrincipalName                        = $user.UserPrincipalName
+            OfficeLocation                           = $user.OfficeLocation
+            Department                               = $user.Department
+            Title                                    = $user.JobTitle
+            AccountEnabled                           = $user.AccountEnabled
+            TeamsDesktopInteractiveLastLogin_UTC     = $desktopI
+            TeamsDesktopNonInteractiveLastLogin_UTC  = $desktopNI
+            TeamsMobileInteractiveLastLogin_UTC      = $mobileI
+            TeamsMobileNonInteractiveLastLogin_UTC   = $mobileNI
         })
     }
 
@@ -500,7 +513,7 @@ function Invoke-SharePointUpload {
 
 #region Main
 
-Write-Log "=== Get-TeamsActivityLog v2.2.0 ==="
+Write-Log "=== Get-TeamsActivityLog v2.4.0 ==="
 Write-Log "Start Time : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
 Write-Log "Days Back  : $DaysBack"
 Write-Log "Report Dir : $ReportBaseDir"
