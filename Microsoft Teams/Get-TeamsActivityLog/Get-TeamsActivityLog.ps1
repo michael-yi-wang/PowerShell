@@ -58,6 +58,13 @@
     {BaseFolderPath}/{OfficeLocation}/YYYY/MM/
     Default: "Teams Activity"
 
+.PARAMETER NonInteractiveDaysBack
+    Lookback window specifically for non-interactive sign-in logs.
+    Accepted values: D1, D7, D14, D30.
+    Non-interactive events (background token refreshes) can be 10–50× more numerous than
+    interactive ones; a shorter window significantly reduces run time on large tenants.
+    Default: D30 (matches -DaysBack).
+
 .PARAMETER SkipSharePointUpload
     Skip uploading reports to SharePoint Online. Useful for testing or local-only runs.
 
@@ -90,8 +97,8 @@
 
 .NOTES
     Author  : Michael Wang
-    Version : 2.4.0
-    Date    : 2026-05-16
+    Version : 2.5.0
+    Date    : 2026-05-17
 
     Required Microsoft Graph API Permissions (Application):
         User.Read.All
@@ -147,7 +154,11 @@ param (
     [string]$SharePointBaseFolderPath = "Teams Activity",
 
     [Parameter(Mandatory = $false, HelpMessage = "Skip uploading reports to SharePoint Online")]
-    [switch]$SkipSharePointUpload
+    [switch]$SkipSharePointUpload,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Lookback window for non-interactive sign-in logs (D1, D7, D14, D30)")]
+    [ValidateSet('D1', 'D7', 'D14', 'D30')]
+    [string]$NonInteractiveDaysBack = 'D30'
 )
 
 #region Initialization
@@ -248,15 +259,23 @@ function Get-ActiveUsers {
 
 function Get-TeamsSignInData {
     [CmdletBinding()]
-    param ([int]$DaysBack)
+    param (
+        [int]$DaysBack,
+        [int]$NonInteractiveDaysBack
+    )
 
-    Write-Log "Querying Teams sign-in logs (interactive + non-interactive) for the last $DaysBack day(s). This may take a while..."
+    Write-Log "Querying Teams sign-in logs: interactive last $DaysBack day(s), non-interactive last $NonInteractiveDaysBack day(s). This may take a while..."
 
-    # $startDate derives from Get-Date only — no user input reaches this filter.
-    $startDate   = (Get-Date).ToUniversalTime().AddDays(-$DaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    # Both date boundaries derive from Get-Date only — no user input reaches these filters.
+    $teamsAppId  = '1fec8e78-bce4-4aaf-ab1b-5451cc387264'
+    $startDateI  = (Get-Date).ToUniversalTime().AddDays(-$DaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $startDateNI = (Get-Date).ToUniversalTime().AddDays(-$NonInteractiveDaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
+
     # Use the stable well-known App ID for Microsoft Teams rather than appDisplayName,
     # which can silently return 0 results if the display name differs in the tenant.
-    $baseFilter   = "appId eq '1fec8e78-bce4-4aaf-ab1b-5451cc387264' and status/errorCode eq 0 and createdDateTime ge $startDate"
+    $filterBase = "appId eq '$teamsAppId' and status/errorCode eq 0"
+    $filterI    = "$filterBase and createdDateTime ge $startDateI"
+    $filterNI   = "$filterBase and createdDateTime ge $startDateNI and signInEventTypes/any(t: t eq 'nonInteractiveUser')"
     $selectFields = 'userId,createdDateTime,deviceDetail'
 
     # Four separate dictionaries — one per platform per auth type — so the report
@@ -273,8 +292,8 @@ function Get-TeamsSignInData {
     # Non-interactive sign-ins are filtered via signInEventTypes/any(t: t eq 'nonInteractiveUser').
     # Ref: https://learn.microsoft.com/entra/identity/monitoring-health/howto-analyze-activity-logs-with-microsoft-graph
     $signInSources = @(
-        @{ Label = 'Interactive';     BaseUri = 'https://graph.microsoft.com/v1.0/auditLogs/signIns'; ODataFilter = $baseFilter;                                                                              DesktopDict = $desktopInteractive;    MobileDict = $mobileInteractive }
-        @{ Label = 'Non-Interactive'; BaseUri = 'https://graph.microsoft.com/beta/auditLogs/signIns'; ODataFilter = "$baseFilter and signInEventTypes/any(t: t eq 'nonInteractiveUser')"; DesktopDict = $desktopNonInteractive; MobileDict = $mobileNonInteractive }
+        @{ Label = 'Interactive';     BaseUri = 'https://graph.microsoft.com/v1.0/auditLogs/signIns'; ODataFilter = $filterI;  DesktopDict = $desktopInteractive;    MobileDict = $mobileInteractive }
+        @{ Label = 'Non-Interactive'; BaseUri = 'https://graph.microsoft.com/beta/auditLogs/signIns'; ODataFilter = $filterNI; DesktopDict = $desktopNonInteractive; MobileDict = $mobileNonInteractive }
     )
 
     try {
@@ -513,10 +532,11 @@ function Invoke-SharePointUpload {
 
 #region Main
 
-Write-Log "=== Get-TeamsActivityLog v2.4.0 ==="
-Write-Log "Start Time : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
-Write-Log "Days Back  : $DaysBack"
-Write-Log "Report Dir : $ReportBaseDir"
+Write-Log "=== Get-TeamsActivityLog v2.5.0 ==="
+Write-Log "Start Time      : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+Write-Log "Days Back       : $DaysBack (interactive)"
+Write-Log "NI Days Back    : $NonInteractiveDaysBack (non-interactive)"
+Write-Log "Report Dir      : $ReportBaseDir"
 
 # Validate SharePoint parameters
 if (-not $SkipSharePointUpload -and [string]::IsNullOrWhiteSpace($SharePointSiteUrl)) {
@@ -601,7 +621,8 @@ try {
         exit 0
     }
 
-    $signInData    = Get-TeamsSignInData -DaysBack $DaysBack
+    $niDays        = [int]$NonInteractiveDaysBack.TrimStart('D')
+    $signInData    = Get-TeamsSignInData -DaysBack $DaysBack -NonInteractiveDaysBack $niDays
     $exportedFiles = Export-TeamsReports -Users $activeUsers -SignInData $signInData
 }
 catch {
