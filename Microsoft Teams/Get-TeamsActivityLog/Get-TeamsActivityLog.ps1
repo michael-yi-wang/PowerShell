@@ -448,7 +448,7 @@ function Invoke-SharePointUpload {
             # Resolve-PnPFolder creates the full path in one call and handles existing folders natively,
             # avoiding brittle exception-message matching that breaks across PnP versions and locales.
             $siteRelPath = ($libraryRoot.TrimStart('/') + '/' + ($folderSegments -join '/'))
-            Resolve-PnPFolder -SiteRelativeUrl $siteRelPath | Out-Null
+            Resolve-PnPFolder -SiteRelativePath $siteRelPath | Out-Null
             $targetFolder = $libraryRoot + '/' + ($folderSegments -join '/')
 
             Write-Log "Uploading '$($fileInfo.FileName)' to $targetFolder..."
