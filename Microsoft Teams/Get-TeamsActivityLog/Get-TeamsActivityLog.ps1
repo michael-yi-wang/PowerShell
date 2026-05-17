@@ -97,7 +97,7 @@
 
 .NOTES
     Author  : Michael Wang
-    Version : 2.5.0
+    Version : 2.5.1
     Date    : 2026-05-17
 
     Required Microsoft Graph API Permissions (Application):
@@ -266,17 +266,14 @@ function Get-TeamsSignInData {
 
     Write-Log "Querying Teams sign-in logs: interactive last $DaysBack day(s), non-interactive last $NonInteractiveDaysBack day(s). This may take a while..."
 
-    # Both date boundaries derive from Get-Date only — no user input reaches these filters.
-    $teamsAppId  = '1fec8e78-bce4-4aaf-ab1b-5451cc387264'
-    $startDateI  = (Get-Date).ToUniversalTime().AddDays(-$DaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $startDateNI = (Get-Date).ToUniversalTime().AddDays(-$NonInteractiveDaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
-
     # Use the stable well-known App ID for Microsoft Teams rather than appDisplayName,
     # which can silently return 0 results if the display name differs in the tenant.
-    $filterBase = "appId eq '$teamsAppId' and status/errorCode eq 0"
-    $filterI    = "$filterBase and createdDateTime ge $startDateI"
-    $filterNI   = "$filterBase and createdDateTime ge $startDateNI and signInEventTypes/any(t: t eq 'nonInteractiveUser')"
+    $teamsAppId   = '1fec8e78-bce4-4aaf-ab1b-5451cc387264'
+    $filterBase   = "appId eq '$teamsAppId' and status/errorCode eq 0"
     $selectFields = 'userId,createdDateTime,deviceDetail'
+
+    # Capture 'now' once so every chunk boundary is consistent across the run.
+    $now = (Get-Date).ToUniversalTime()
 
     # Four separate dictionaries — one per platform per auth type — so the report
     # shows interactive and non-interactive last logins as distinct columns.
@@ -291,63 +288,92 @@ function Get-TeamsSignInData {
     # Both sign-in types use the /signIns endpoint (beta required for signInEventTypes filter).
     # Non-interactive sign-ins are filtered via signInEventTypes/any(t: t eq 'nonInteractiveUser').
     # Ref: https://learn.microsoft.com/entra/identity/monitoring-health/howto-analyze-activity-logs-with-microsoft-graph
+    #
+    # Queries are split into 1-day chunks to prevent Graph skip-token expiry, which occurs
+    # when a single paginated session runs too long on large result sets.
     $signInSources = @(
-        @{ Label = 'Interactive';     BaseUri = 'https://graph.microsoft.com/v1.0/auditLogs/signIns'; ODataFilter = $filterI;  DesktopDict = $desktopInteractive;    MobileDict = $mobileInteractive }
-        @{ Label = 'Non-Interactive'; BaseUri = 'https://graph.microsoft.com/beta/auditLogs/signIns'; ODataFilter = $filterNI; DesktopDict = $desktopNonInteractive; MobileDict = $mobileNonInteractive }
+        @{
+            Label       = 'Interactive'
+            BaseUri     = 'https://graph.microsoft.com/v1.0/auditLogs/signIns'
+            ExtraFilter = ''
+            DaysBack    = $DaysBack
+            DesktopDict = $desktopInteractive
+            MobileDict  = $mobileInteractive
+        }
+        @{
+            Label       = 'Non-Interactive'
+            BaseUri     = 'https://graph.microsoft.com/beta/auditLogs/signIns'
+            ExtraFilter = " and signInEventTypes/any(t: t eq 'nonInteractiveUser')"
+            DaysBack    = $NonInteractiveDaysBack
+            DesktopDict = $desktopNonInteractive
+            MobileDict  = $mobileNonInteractive
+        }
     )
 
     try {
         foreach ($source in $signInSources) {
             Write-Log "Querying $($source.Label) sign-in logs..."
             $sourceCount = 0
+            $chunkStart  = $now.AddDays(-$source.DaysBack)
 
-            $encodedFilter = [uri]::EscapeDataString($source.ODataFilter)
-            $uri = "$($source.BaseUri)?`$filter=$encodedFilter&`$select=$selectFields&`$top=999"
+            while ($chunkStart -lt $now) {
+                $chunkEnd = $chunkStart.AddDays(1)
+                if ($chunkEnd -gt $now) { $chunkEnd = $now }
 
-            try {
-                do {
-                    $response = Invoke-MgGraphRequest -Uri $uri -Method GET -OutputType PSObject -ErrorAction Stop
+                $startStr    = $chunkStart.ToString("yyyy-MM-ddTHH:mm:ssZ")
+                $endStr      = $chunkEnd.ToString("yyyy-MM-ddTHH:mm:ssZ")
+                $chunkFilter = "$filterBase and createdDateTime ge $startStr and createdDateTime lt $endStr$($source.ExtraFilter)"
 
-                    foreach ($record in $response.value) {
-                        $sourceCount++
-                        $totalRecords++
+                $encodedFilter = [uri]::EscapeDataString($chunkFilter)
+                $uri = "$($source.BaseUri)?`$filter=$encodedFilter&`$select=$selectFields&`$top=999"
 
-                        if ($totalRecords % 500 -eq 0) {
-                            $elapsed = [math]::Round($stopwatch.Elapsed.TotalSeconds, 0)
-                            Write-Progress -Activity 'Processing Teams sign-in logs' `
-                                -Status "Records processed: $totalRecords (${elapsed}s elapsed)" -PercentComplete -1
-                            Write-Log "Processed $totalRecords sign-in records so far..."
-                        }
+                try {
+                    do {
+                        $response = Invoke-MgGraphRequest -Uri $uri -Method GET -OutputType PSObject -ErrorAction Stop
 
-                        $userId = $record.userId
-                        if ([string]::IsNullOrWhiteSpace($userId)) { continue }
+                        foreach ($record in $response.value) {
+                            $sourceCount++
+                            $totalRecords++
 
-                        $os = $record.deviceDetail?.operatingSystem
-                        # REST response returns createdDateTime as an ISO 8601 string; DateTimeOffset.Parse
-                        # handles the Z suffix correctly and produces a UTC offset.
-                        $loginTime = [System.DateTimeOffset]::Parse($record.createdDateTime.ToString())
-                        # Browser/web client sign-ins report no OS; treat as Desktop (web from a desktop).
-                        if ([string]::IsNullOrWhiteSpace($os)) { $os = 'Web' }
+                            if ($totalRecords % 500 -eq 0) {
+                                $elapsed = [math]::Round($stopwatch.Elapsed.TotalSeconds, 0)
+                                Write-Progress -Activity 'Processing Teams sign-in logs' `
+                                    -Status "Records processed: $totalRecords (${elapsed}s elapsed)" -PercentComplete -1
+                                Write-Log "Processed $totalRecords sign-in records so far..."
+                            }
 
-                        if ($os -in $MobileOSList) {
-                            if (-not $source.MobileDict.ContainsKey($userId) -or $loginTime -gt $source.MobileDict[$userId]) {
-                                $source.MobileDict[$userId] = $loginTime
+                            $userId = $record.userId
+                            if ([string]::IsNullOrWhiteSpace($userId)) { continue }
+
+                            $os = $record.deviceDetail?.operatingSystem
+                            # REST response returns createdDateTime as an ISO 8601 string; DateTimeOffset.Parse
+                            # handles the Z suffix correctly and produces a UTC offset.
+                            $loginTime = [System.DateTimeOffset]::Parse($record.createdDateTime.ToString())
+                            # Browser/web client sign-ins report no OS; treat as Desktop (web from a desktop).
+                            if ([string]::IsNullOrWhiteSpace($os)) { $os = 'Web' }
+
+                            if ($os -in $MobileOSList) {
+                                if (-not $source.MobileDict.ContainsKey($userId) -or $loginTime -gt $source.MobileDict[$userId]) {
+                                    $source.MobileDict[$userId] = $loginTime
+                                }
+                            }
+                            else {
+                                if (-not $source.DesktopDict.ContainsKey($userId) -or $loginTime -gt $source.DesktopDict[$userId]) {
+                                    $source.DesktopDict[$userId] = $loginTime
+                                }
                             }
                         }
-                        else {
-                            if (-not $source.DesktopDict.ContainsKey($userId) -or $loginTime -gt $source.DesktopDict[$userId]) {
-                                $source.DesktopDict[$userId] = $loginTime
-                            }
-                        }
-                    }
 
-                    # PSObject.Properties lookup avoids strict-mode error when @odata.nextLink is absent on the last page.
-                    $uri = $response.PSObject.Properties['@odata.nextLink']?.Value
-                } while ($uri)
-            }
-            catch {
-                Write-Log "Error while retrieving $($source.Label) sign-in logs: $_" -Level Error
-                throw
+                        # PSObject.Properties lookup avoids strict-mode error when @odata.nextLink is absent on the last page.
+                        $uri = $response.PSObject.Properties['@odata.nextLink']?.Value
+                    } while ($uri)
+                }
+                catch {
+                    Write-Log "Error while retrieving $($source.Label) sign-in logs (chunk: $startStr to $endStr): $_" -Level Error
+                    throw
+                }
+
+                $chunkStart = $chunkEnd
             }
 
             Write-Log "$($source.Label) sign-in log query complete. Records: $sourceCount."
@@ -532,7 +558,7 @@ function Invoke-SharePointUpload {
 
 #region Main
 
-Write-Log "=== Get-TeamsActivityLog v2.5.0 ==="
+Write-Log "=== Get-TeamsActivityLog v2.5.1 ==="
 Write-Log "Start Time      : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
 Write-Log "Days Back       : $DaysBack (interactive)"
 Write-Log "NI Days Back    : $NonInteractiveDaysBack (non-interactive)"
