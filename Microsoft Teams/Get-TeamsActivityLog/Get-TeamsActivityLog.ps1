@@ -270,10 +270,11 @@ function Get-TeamsSignInData {
     $stopwatch    = [System.Diagnostics.Stopwatch]::StartNew()
 
     # Interactive and non-interactive sign-ins live on separate REST endpoints.
+    # nonInteractiveUserSignIns is only available in the beta API, not v1.0.
     # Both are queried via Invoke-MgGraphRequest to avoid SDK cmdlet availability issues.
     $signInSources = @(
-        @{ Label = 'Interactive';     Endpoint = 'auditLogs/signIns';                    DesktopDict = $desktopInteractive;    MobileDict = $mobileInteractive }
-        @{ Label = 'Non-Interactive'; Endpoint = 'auditLogs/nonInteractiveUserSignIns';  DesktopDict = $desktopNonInteractive; MobileDict = $mobileNonInteractive }
+        @{ Label = 'Interactive';     BaseUri = 'https://graph.microsoft.com/v1.0/auditLogs/signIns';                   DesktopDict = $desktopInteractive;    MobileDict = $mobileInteractive }
+        @{ Label = 'Non-Interactive'; BaseUri = 'https://graph.microsoft.com/beta/auditLogs/nonInteractiveUserSignIns'; DesktopDict = $desktopNonInteractive; MobileDict = $mobileNonInteractive }
     )
 
     try {
@@ -282,7 +283,7 @@ function Get-TeamsSignInData {
             $sourceCount = 0
 
             $encodedFilter = [uri]::EscapeDataString($odataFilter)
-            $uri = "https://graph.microsoft.com/v1.0/$($source.Endpoint)?`$filter=$encodedFilter&`$select=$selectFields&`$top=999"
+            $uri = "$($source.BaseUri)?`$filter=$encodedFilter&`$select=$selectFields&`$top=999"
 
             try {
                 do {
