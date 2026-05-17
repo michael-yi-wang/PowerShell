@@ -2,99 +2,149 @@
 
 <#
 .SYNOPSIS
-    Retrieves Microsoft Teams last sign-in activity (Desktop and Mobile) for all active users.
+    Retrieves Microsoft Teams last sign-in activity for all active users, grouped by Office Location.
 
 .DESCRIPTION
-    Connects to Microsoft Graph using app-only certificate authentication and retrieves
-    Teams sign-in activity from the Entra ID audit logs for all active, non-guest users.
+    Connects to Microsoft Graph (app-only or interactive) and retrieves Teams sign-in activity
+    from Entra ID audit logs for all active, non-guest users in the tenant.
 
-    Desktop vs Mobile is determined by the sign-in's device operating system:
-      - Mobile : iOS, Android, Windows Phone
-      - Desktop : all other non-empty OS values (Windows, macOS, Linux, etc.)
+    Desktop vs Mobile classification is based on the sign-in device operating system:
+      - Mobile  : iOS, Android, Windows Phone
+      - Desktop : Windows, macOS, Linux, ChromeOS, and any sign-in with no OS reported
+                  (browser/web client sessions report no OS and are treated as Desktop)
 
     Results are grouped by Office Location and written to:
-      <script_dir>/report/<office_location>/<YYYY-MM-DD>_teams_activity.csv
+      <script_dir>/report/<OfficeLocation>/YYYY/MM/<OfficeLocation>-TeamsActivity-YYYYMMDD.csv
+
+    Optionally uploads each location CSV to SharePoint Online under:
+      {DocumentLibrary}/{BaseFolderPath}/{OfficeLocation}/YYYY/MM/
 
     Execution logs are written to:
-      <script_dir>/logs/<YYYY-MM-DD_HH-mm-ss>_TeamsActivityLog.log
+      <script_dir>/logs/Get-TeamsActivityLog_YYYYMMDD_HHmmss.log
 
 .PARAMETER TenantId
-    Azure AD / Entra ID Tenant ID (GUID).
+    Entra ID Tenant ID (GUID).
 
 .PARAMETER ClientId
-    Application (Client) ID of the registered Entra application.
+    App Registration Client ID. Required for certificate-based (non-interactive) auth.
 
 .PARAMETER CertificateThumbprint
-    Thumbprint of the authentication certificate installed in the local certificate store.
-    Recommended for Windows. Works on macOS when the certificate is in the login keychain.
+    Certificate thumbprint for non-interactive auth. Must be installed in the current user
+    or local machine certificate store. Recommended for Windows.
 
 .PARAMETER CertificatePath
-    Full path to a .pfx certificate file. Cross-platform alternative to CertificateThumbprint.
+    Full path to a .pfx certificate file. Cross-platform alternative to -CertificateThumbprint.
 
 .PARAMETER CertificatePassword
-    SecureString password for the .pfx file. Required when CertificatePath is used.
+    SecureString password for the .pfx file. Required when -CertificatePath is used.
 
 .PARAMETER DaysBack
     Number of days to look back in sign-in logs. Default: 30. Maximum: 30 for non-P2 tenants.
 
-.EXAMPLE
-    .\Get-TeamsActivityLog.ps1 `
-        -TenantId  'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
-        -ClientId  'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
-        -CertificateThumbprint 'ABCDEF1234567890ABCDEF1234567890ABCDEF12'
+.PARAMETER SharePointSiteUrl
+    Full SharePoint Online site URL.
+    Example: https://contoso.sharepoint.com/sites/IT
+
+.PARAMETER SharePointDocumentLibrary
+    Site-relative URL name of the document library (use URL name, not display name).
+    Default: "Documents"
+
+.PARAMETER SharePointBaseFolderPath
+    Base folder within the document library. Files are organised under
+    {BaseFolderPath}/{OfficeLocation}/YYYY/MM/
+    Default: "Teams Activity"
+
+.PARAMETER SkipSharePointUpload
+    Skip uploading reports to SharePoint Online. Useful for testing or local-only runs.
 
 .EXAMPLE
+    # Interactive run — local report only
+    .\Get-TeamsActivityLog.ps1 `
+        -TenantId         'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
+        -SkipSharePointUpload
+
+.EXAMPLE
+    # App-only (certificate thumbprint) with SharePoint upload
+    .\Get-TeamsActivityLog.ps1 `
+        -TenantId              'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
+        -ClientId              'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
+        -CertificateThumbprint 'ABCDEF1234567890ABCDEF1234567890ABCDEF12' `
+        -SharePointSiteUrl     'https://contoso.sharepoint.com/sites/IT' `
+        -SharePointDocumentLibrary 'Documents' `
+        -SharePointBaseFolderPath  'Teams Activity'
+
+.EXAMPLE
+    # App-only (PFX file, macOS) with SharePoint upload, 14-day lookback
     $pwd = Read-Host -AsSecureString 'Certificate password'
     .\Get-TeamsActivityLog.ps1 `
-        -TenantId       'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
-        -ClientId       'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
-        -CertificatePath '/Users/admin/certs/app.pfx' `
+        -TenantId            'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
+        -ClientId            'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
+        -CertificatePath     '/Users/admin/certs/app.pfx' `
         -CertificatePassword $pwd `
-        -DaysBack 14
+        -SharePointSiteUrl   'https://contoso.sharepoint.com/sites/IT' `
+        -DaysBack            14
 
 .NOTES
     Author  : Michael Wang
-    Version : 1.0.0
-    Date    : 2026-05-04
+    Version : 2.1.0
+    Date    : 2026-05-16
 
     Required Microsoft Graph API Permissions (Application):
         User.Read.All
         AuditLog.Read.All
 
+    SharePoint Permissions (when -SkipSharePointUpload is NOT specified):
+        SharePoint API (Application): Sites.Selected
+        Grant site-level access:
+          Grant-PnPAzureADAppSitePermission -AppId <ClientId> -DisplayName <AppName> `
+              -Site <SiteUrl> -Permissions Manage
+
     Required PowerShell Modules:
         Microsoft.Graph.Authentication
         Microsoft.Graph.Users
         Microsoft.Graph.Identity.SignIns
+        PnP.PowerShell                    (required unless -SkipSharePointUpload is specified)
 #>
 
 [CmdletBinding()]
 param (
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, HelpMessage = "Entra ID Tenant ID (GUID)")]
     [ValidateNotNullOrEmpty()]
-    [string]$TenantId,
+    [guid]$TenantId,
 
-    [Parameter(Mandatory = $true)]
-    [ValidateNotNullOrEmpty()]
+    [Parameter(Mandatory = $false, HelpMessage = "App Registration Client ID for non-interactive auth")]
     [string]$ClientId,
 
-    [Parameter(Mandatory = $false)]
+    [Parameter(Mandatory = $false, HelpMessage = "Certificate thumbprint for non-interactive auth")]
     [string]$CertificateThumbprint,
 
-    [Parameter(Mandatory = $false)]
+    [Parameter(Mandatory = $false, HelpMessage = "Path to a .pfx certificate file (cross-platform alternative to thumbprint)")]
     [ValidateScript({
-        if (-not (Test-Path $_ -PathType Leaf)) {
+        if (-not [string]::IsNullOrWhiteSpace($_) -and -not (Test-Path $_ -PathType Leaf)) {
             throw "Certificate file not found: $_"
         }
         $true
     })]
     [string]$CertificatePath,
 
-    [Parameter(Mandatory = $false)]
+    [Parameter(Mandatory = $false, HelpMessage = "SecureString password for the .pfx file")]
     [SecureString]$CertificatePassword,
 
-    [Parameter(Mandatory = $false)]
+    [Parameter(Mandatory = $false, HelpMessage = "Number of days to look back in sign-in logs (1-30)")]
     [ValidateRange(1, 30)]
-    [int]$DaysBack = 30
+    [int]$DaysBack = 30,
+
+    [Parameter(Mandatory = $false, HelpMessage = "SharePoint Online site URL")]
+    [string]$SharePointSiteUrl,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Document library URL name (not display name)")]
+    [string]$SharePointDocumentLibrary = "Documents",
+
+    [Parameter(Mandatory = $false, HelpMessage = "Base folder path within the document library")]
+    [string]$SharePointBaseFolderPath = "Teams Activity",
+
+    [Parameter(Mandatory = $false, HelpMessage = "Skip uploading reports to SharePoint Online")]
+    [switch]$SkipSharePointUpload
 )
 
 #region Initialization
@@ -102,16 +152,25 @@ param (
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptRoot    = $PSScriptRoot
-$RunDate       = Get-Date -Format 'yyyy-MM-dd'
-$RunDateTime   = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
+$ScriptRoot      = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$scriptStartTime = Get-Date
+$RunDate         = $scriptStartTime.ToString('yyyyMMdd')
+$RunDateTime     = $scriptStartTime.ToString('yyyyMMdd_HHmmss')
+$YearFolder      = $scriptStartTime.ToString('yyyy')
+$MonthFolder     = $scriptStartTime.ToString('MM')
+
 $LogDirectory  = Join-Path $ScriptRoot 'logs'
 $ReportBaseDir = Join-Path $ScriptRoot 'report'
-$LogFile       = Join-Path $LogDirectory "${RunDateTime}_TeamsActivityLog.log"
 
-$MobileOSList  = @('iOS', 'Android', 'Windows Phone')
+if (-not (Test-Path $LogDirectory)) {
+    New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
+}
 
-$RequiredModules = @(
+$LogFile = Join-Path $LogDirectory "Get-TeamsActivityLog_${RunDateTime}.log"
+
+$MobileOSList = @('iOS', 'Android', 'Windows Phone')
+
+$GraphModules = @(
     'Microsoft.Graph.Authentication',
     'Microsoft.Graph.Users',
     'Microsoft.Graph.Identity.SignIns'
@@ -122,10 +181,6 @@ $RequiredModules = @(
 #region Functions
 
 function Write-Log {
-    <#
-    .SYNOPSIS
-        Writes a timestamped message to the console and to the log file.
-    #>
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
@@ -136,87 +191,49 @@ function Write-Log {
         [string]$Level = 'Info'
     )
 
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $logEntry  = "[$timestamp] [$Level] $Message"
+    $entry = "[{0}] [{1,-7}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
 
-    $color = switch ($Level) {
-        'Info'    { 'Green' }
-        'Warning' { 'Yellow' }
-        'Error'   { 'Red' }
+    switch ($Level) {
+        'Info'    { Write-Host $entry -ForegroundColor Green }
+        'Warning' { Write-Host $entry -ForegroundColor Yellow }
+        'Error'   { Write-Host $entry -ForegroundColor Red }
     }
 
-    Write-Host $logEntry -ForegroundColor $color
-    Add-Content -Path $LogFile -Value $logEntry -Encoding UTF8
+    Add-Content -Path $LogFile -Value $entry -Encoding UTF8
 }
 
-function Test-RequiredModules {
-    <#
-    .SYNOPSIS
-        Checks that all required Graph PowerShell sub-modules are installed.
-        Returns $true if all are present, $false otherwise and prints instructions.
-    #>
-    $missing = @()
+function Assert-RequiredModule {
+    param ([string]$ModuleName)
 
-    foreach ($module in $RequiredModules) {
-        if (-not (Get-Module -ListAvailable -Name $module)) {
-            $missing += $module
-        }
+    if (-not (Get-Module -ListAvailable -Name $ModuleName)) {
+        Write-Log "Required module '$ModuleName' is not installed. Run: Install-Module $ModuleName -Scope CurrentUser" -Level Error
+        throw "Module '$ModuleName' is required but not installed."
     }
-
-    if ($missing.Count -gt 0) {
-        Write-Host ''
-        Write-Host 'ERROR: The following required PowerShell module(s) are not installed:' -ForegroundColor Red
-        $missing | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
-        Write-Host ''
-        Write-Host 'To install all required modules, run:' -ForegroundColor Yellow
-        Write-Host '  Install-Module -Name Microsoft.Graph -Scope CurrentUser -Repository PSGallery' -ForegroundColor Yellow
-        Write-Host ''
-        return $false
-    }
-
-    return $true
 }
 
 function Get-SafeFolderName {
-    <#
-    .SYNOPSIS
-        Sanitizes a string for use as a folder name on both Windows and macOS.
-    #>
-    param (
-        [string]$Name
-    )
+    param ([string]$Name)
 
-    if ([string]::IsNullOrWhiteSpace($Name)) {
-        return 'Unknown_Location'
-    }
+    if ([string]::IsNullOrWhiteSpace($Name)) { return 'Unknown_Location' }
 
-    # Remove characters forbidden in Windows/macOS folder names
-    $safe = $Name -replace '[\\/:*?"<>|]', '_'
-    return $safe.Trim()
+    $safe = ($Name -replace '[\\/:*?"<>|]', '_').Trim().TrimEnd('.')
+
+    # Prefix Windows NTFS reserved device names to prevent filesystem errors on Windows
+    if ($safe -match '^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$') { $safe = "_$safe" }
+
+    return $safe
 }
 
 function Get-ActiveUsers {
-    <#
-    .SYNOPSIS
-        Returns all enabled, non-guest user accounts from Entra ID with the
-        properties needed for the report.
-    #>
     Write-Log 'Retrieving active member users from Microsoft Entra ID...'
-
-    $selectProps = @(
-        'id', 'displayName', 'userPrincipalName',
-        'officeLocation', 'jobTitle', 'userType', 'accountEnabled'
-    )
-
-    $filter = "userType eq 'Member' and accountEnabled eq true"
 
     try {
         $users = Get-MgUser `
-            -Filter            $filter `
-            -Select            $selectProps `
+            -Filter           "userType eq 'Member' and accountEnabled eq true" `
+            -Select           @('id','displayName','userPrincipalName','mail','officeLocation','jobTitle','department','accountEnabled') `
             -All `
-            -ConsistencyLevel  eventual `
-            -CountVariable     totalCount
+            -ConsistencyLevel eventual `
+            -CountVariable    totalCount
 
         Write-Log "Retrieved $($users.Count) active member user(s)."
         return $users
@@ -228,66 +245,57 @@ function Get-ActiveUsers {
 }
 
 function Get-TeamsSignInData {
-    <#
-    .SYNOPSIS
-        Queries Entra ID sign-in logs for Microsoft Teams over the specified
-        lookback period and returns the latest Desktop and Mobile login time
-        per user (keyed by user object ID).
-    #>
     [CmdletBinding()]
-    param (
-        [int]$DaysBack
-    )
+    param ([int]$DaysBack)
 
     Write-Log "Querying Teams sign-in logs for the last $DaysBack day(s). This may take a while..."
 
-    $startDate    = (Get-Date).ToUniversalTime().AddDays(-$DaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $odataFilter  = "appDisplayName eq 'Microsoft Teams' and status/errorCode eq 0 and createdDateTime ge $startDate"
-
-    $selectProps = @('userId', 'userPrincipalName', 'createdDateTime', 'deviceDetail')
+    # $startDate derives from Get-Date only — no user input reaches this filter.
+    $startDate   = (Get-Date).ToUniversalTime().AddDays(-$DaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    # Use the stable well-known App ID for Microsoft Teams rather than appDisplayName,
+    # which can silently return 0 results if the display name differs in the tenant.
+    $odataFilter = "appId eq '1fec8e78-bce4-4aaf-ab1b-5451cc387264' and status/errorCode eq 0 and createdDateTime ge $startDate"
 
     $userDesktopLogin = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
     $userMobileLogin  = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
 
-    $recordCount  = 0
-    $stopwatch    = [System.Diagnostics.Stopwatch]::StartNew()
+    $recordCount = 0
+    $stopwatch   = [System.Diagnostics.Stopwatch]::StartNew()
 
     try {
         Get-MgAuditLogSignIn `
             -Filter   $odataFilter `
-            -Select   $selectProps `
+            -Select   @('userId','createdDateTime','deviceDetail') `
             -All `
             -PageSize 999 |
         ForEach-Object {
-            $signIn  = $_
             $recordCount++
 
-            # Progress update every 2 000 records
-            if ($recordCount % 2000 -eq 0) {
+            if ($recordCount % 500 -eq 0) {
                 $elapsed = [math]::Round($stopwatch.Elapsed.TotalSeconds, 0)
-                Write-Progress `
-                    -Activity        'Processing Teams sign-in logs' `
-                    -Status          "Records processed: $recordCount (${elapsed}s elapsed)" `
-                    -PercentComplete -1
+                Write-Progress -Activity 'Processing Teams sign-in logs' `
+                    -Status "Records processed: $recordCount (${elapsed}s elapsed)" -PercentComplete -1
                 Write-Log "Processed $recordCount sign-in records so far..."
             }
 
-            $userId = $signIn.UserId
+            $userId = $_.UserId
             if ([string]::IsNullOrWhiteSpace($userId)) { return }
 
-            $os          = $signIn.DeviceDetail.OperatingSystem
-            $loginTime   = $signIn.CreatedDateTime
-
-            if ([string]::IsNullOrWhiteSpace($os)) { return }
+            $os = $_.DeviceDetail.OperatingSystem
+            # Graph SDK returns CreatedDateTime as DateTime (no offset); force UTC so it compares
+            # cleanly against the DateTimeOffset dictionary values.
+            $loginTime = [System.DateTimeOffset]::new(
+                [System.DateTime]::SpecifyKind($_.CreatedDateTime, [System.DateTimeKind]::Utc)
+            )
+            # Browser/web client sign-ins report no OS; treat as Desktop (web from a desktop).
+            if ([string]::IsNullOrWhiteSpace($os)) { $os = 'Web' }
 
             if ($os -in $MobileOSList) {
-                # Mobile sign-in
                 if (-not $userMobileLogin.ContainsKey($userId) -or $loginTime -gt $userMobileLogin[$userId]) {
                     $userMobileLogin[$userId] = $loginTime
                 }
             }
             else {
-                # Desktop / web sign-in (Windows, macOS, Linux, ChromeOS, etc.)
                 if (-not $userDesktopLogin.ContainsKey($userId) -or $loginTime -gt $userDesktopLogin[$userId]) {
                     $userDesktopLogin[$userId] = $loginTime
                 }
@@ -303,29 +311,18 @@ function Get-TeamsSignInData {
         $stopwatch.Stop()
     }
 
-    Write-Log "Sign-in log processing complete. Total records processed: $recordCount."
+    Write-Log "Sign-in log processing complete. Total records: $recordCount."
     Write-Log "Users with Teams Desktop activity : $($userDesktopLogin.Count)"
     Write-Log "Users with Teams Mobile activity  : $($userMobileLogin.Count)"
 
-    return @{
-        Desktop = $userDesktopLogin
-        Mobile  = $userMobileLogin
-    }
+    return @{ Desktop = $userDesktopLogin; Mobile = $userMobileLogin }
 }
 
-function Export-TeamReports {
-    <#
-    .SYNOPSIS
-        Merges user data with sign-in data, groups results by Office Location,
-        and exports each group to a dated CSV file.
-    #>
+function Export-TeamsReports {
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory = $true)]
-        [object[]]$Users,
-
-        [Parameter(Mandatory = $true)]
-        [hashtable]$SignInData
+        [Parameter(Mandatory = $true)] [object[]]$Users,
+        [Parameter(Mandatory = $true)] [hashtable]$SignInData
     )
 
     Write-Log 'Building report records...'
@@ -337,130 +334,222 @@ function Export-TeamReports {
         $mobileLogin  = $null
 
         if ($SignInData.Desktop.ContainsKey($user.Id)) {
-            $desktopLogin = $SignInData.Desktop[$user.Id].LocalDateTime.ToString('yyyy-MM-dd HH:mm:ss')
+            $desktopLogin = $SignInData.Desktop[$user.Id].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss')
         }
         if ($SignInData.Mobile.ContainsKey($user.Id)) {
-            $mobileLogin = $SignInData.Mobile[$user.Id].LocalDateTime.ToString('yyyy-MM-dd HH:mm:ss')
-        }
-
-        # Normalise empty office location for grouping
-        $officeLocation = if ([string]::IsNullOrWhiteSpace($user.OfficeLocation)) {
-            $null
-        }
-        else {
-            $user.OfficeLocation
+            $mobileLogin = $SignInData.Mobile[$user.Id].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss')
         }
 
         $results.Add([PSCustomObject]@{
-            DisplayName                   = $user.DisplayName
-            UserPrincipalName             = $user.UserPrincipalName
-            OfficeLocation                = $officeLocation
-            Title                         = $user.JobTitle
-            LastLoginDateTime_TeamsDesktop = $desktopLogin
-            LastLoginDateTime_TeamsMobile  = $mobileLogin
+            DisplayName               = $user.DisplayName
+            Email                     = if ($user.Mail) { $user.Mail } else { $user.UserPrincipalName }
+            UserPrincipalName         = $user.UserPrincipalName
+            OfficeLocation            = $user.OfficeLocation
+            Department                = $user.Department
+            Title                     = $user.JobTitle
+            AccountEnabled            = $user.AccountEnabled
+            TeamsDesktopLastLogin_UTC = $desktopLogin
+            TeamsMobileLastLogin_UTC  = $mobileLogin
         })
     }
 
-    # Group by office location; null/empty → 'Unknown_Location'
     $groups = $results | Group-Object -Property { Get-SafeFolderName $_.OfficeLocation }
 
     Write-Log "Exporting $($groups.Count) location group(s) to CSV..."
 
+    $exportedFiles = [System.Collections.Generic.List[PSCustomObject]]::new()
+
     foreach ($group in $groups) {
-        $locationFolder = $group.Name    # already sanitised by the group key expression
-        $outputDir      = Join-Path $ReportBaseDir $locationFolder
+        $locationName = $group.Name
+        $outputDir    = Join-Path $ReportBaseDir $locationName $YearFolder $MonthFolder
 
         if (-not (Test-Path $outputDir)) {
             New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
         }
 
-        $outputFile = Join-Path $outputDir "${RunDate}_teams_activity.csv"
+        $fileName   = "${locationName}-TeamsActivity-${RunDate}.csv"
+        $outputFile = Join-Path $outputDir $fileName
+
         $group.Group | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
 
-        Write-Log "  [$locationFolder] $($group.Group.Count) record(s) → $outputFile"
+        Write-Log "  [$locationName] $($group.Group.Count) record(s) -> $outputFile"
+
+        $exportedFiles.Add([PSCustomObject]@{
+            LocationName = $locationName
+            FilePath     = $outputFile
+            FileName     = $fileName
+        })
     }
 
-    Write-Log "Report export complete. Total users in report: $($results.Count)"
+    Write-Log "Report export complete. Total users: $($results.Count)"
+    # Unary comma preserves the List<T> as a single object; without it PowerShell unwraps it.
+    return , $exportedFiles
+}
+
+function Invoke-SharePointUpload {
+    # Implicit script-scope dependencies (read-only):
+    #   $SharePointSiteUrl, $SharePointDocumentLibrary, $SharePointBaseFolderPath
+    #   $TenantId, $ClientId, $CertificateThumbprint, $CertificatePath, $CertificatePassword
+    #   $YearFolder, $MonthFolder
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Generic.List[PSCustomObject]]$ExportedFiles,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$UseAppOnlyAuth,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$UseThumbprint
+    )
+
+    Write-Log "Connecting to SharePoint Online: $SharePointSiteUrl"
+
+    try {
+        if ($UseAppOnlyAuth) {
+            $pnpParams = @{
+                Url    = $SharePointSiteUrl
+                Tenant = $TenantId.ToString()
+            }
+
+            if ($UseThumbprint) {
+                $pnpParams['ClientId']   = $ClientId
+                $pnpParams['Thumbprint'] = $CertificateThumbprint
+            }
+            else {
+                $pnpParams['ClientId']            = $ClientId
+                $pnpParams['CertificatePath']     = $CertificatePath
+                $pnpParams['CertificatePassword'] = $CertificatePassword
+            }
+
+            Connect-PnPOnline @pnpParams
+        }
+        else {
+            Connect-PnPOnline -Url $SharePointSiteUrl -Interactive
+        }
+
+        Write-Log "Connected to SharePoint Online."
+    }
+    catch {
+        Write-Log "Failed to connect to SharePoint Online: $_" -Level Error
+        throw
+    }
+
+    try {
+        $library     = Get-PnPList -Identity $SharePointDocumentLibrary -Includes RootFolder -ErrorAction Stop
+        $libraryRoot = $library.RootFolder.ServerRelativeUrl.TrimEnd('/')
+        Write-Log "Library root: $libraryRoot"
+
+        foreach ($fileInfo in $ExportedFiles) {
+            # Folder hierarchy: BaseFolderPath / OfficeLocation / YYYY / MM
+            $baseSegments   = $SharePointBaseFolderPath.Split('/') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            $folderSegments = @($baseSegments) + @($fileInfo.LocationName, $YearFolder, $MonthFolder)
+
+            # Resolve-PnPFolder creates the full path in one call and handles existing folders natively,
+            # avoiding brittle exception-message matching that breaks across PnP versions and locales.
+            $siteRelPath = ($libraryRoot.TrimStart('/') + '/' + ($folderSegments -join '/'))
+            Resolve-PnPFolder -SiteRelativeUrl $siteRelPath | Out-Null
+            $targetFolder = $libraryRoot + '/' + ($folderSegments -join '/')
+
+            Write-Log "Uploading '$($fileInfo.FileName)' to $targetFolder..."
+            Add-PnPFile -Path $fileInfo.FilePath -Folder $targetFolder | Out-Null
+            Write-Log "Uploaded: $targetFolder/$($fileInfo.FileName)"
+        }
+    }
+    catch {
+        Write-Log "Failed during SharePoint upload: $_" -Level Error
+        throw
+    }
+    finally {
+        try { Disconnect-PnPOnline; Write-Log "Disconnected from SharePoint Online." }
+        catch { Write-Log "Could not cleanly disconnect from SharePoint Online." -Level Warning }
+    }
 }
 
 #endregion
 
 #region Main
 
-# Ensure log directory exists before first Write-Log call
-if (-not (Test-Path $LogDirectory)) {
-    New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
-}
+Write-Log "=== Get-TeamsActivityLog v2.1.0 ==="
+Write-Log "Start Time : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+Write-Log "Days Back  : $DaysBack"
+Write-Log "Report Dir : $ReportBaseDir"
 
-Write-Log '=========================================='
-Write-Log ' Get-TeamsActivityLog  v1.0.0'
-Write-Log "  Run date : $RunDate"
-Write-Log "  Days back: $DaysBack"
-Write-Log '=========================================='
-
-# Validate that exactly one certificate method is supplied
-if ([string]::IsNullOrWhiteSpace($CertificateThumbprint) -and [string]::IsNullOrWhiteSpace($CertificatePath)) {
-    Write-Log 'You must supply either -CertificateThumbprint or -CertificatePath.' -Level Error
+# Validate SharePoint parameters
+if (-not $SkipSharePointUpload -and [string]::IsNullOrWhiteSpace($SharePointSiteUrl)) {
+    Write-Log "-SharePointSiteUrl is required unless -SkipSharePointUpload is specified." -Level Error
     exit 1
 }
 
-if (-not [string]::IsNullOrWhiteSpace($CertificatePath) -and $null -eq $CertificatePassword) {
-    Write-Log '-CertificatePassword is required when -CertificatePath is used.' -Level Error
+# Determine authentication mode
+$clientIdProvided   = -not [string]::IsNullOrWhiteSpace($ClientId)
+$thumbprintProvided = -not [string]::IsNullOrWhiteSpace($CertificateThumbprint)
+$certPathProvided   = -not [string]::IsNullOrWhiteSpace($CertificatePath)
+
+if ($certPathProvided -and $null -eq $CertificatePassword) {
+    Write-Log "-CertificatePassword is required when -CertificatePath is used." -Level Error
     exit 1
 }
 
-# Module check
-if (-not (Test-RequiredModules)) {
-    exit 1
-}
+$useAppOnlyAuth = $clientIdProvided -and ($thumbprintProvided -or $certPathProvided)
+Write-Log "Auth Mode  : $(if ($useAppOnlyAuth) { 'App-Only (Certificate)' } else { 'Interactive (Delegated)' })"
 
-# Import modules
-try {
-    foreach ($module in $RequiredModules) {
-        Import-Module $module -ErrorAction Stop
-    }
-    Write-Log 'Required modules imported successfully.'
-}
-catch {
-    Write-Log "Failed to import module: $_" -Level Error
-    exit 1
-}
+# Validate required modules
+foreach ($module in $GraphModules) { Assert-RequiredModule -ModuleName $module }
+if (-not $SkipSharePointUpload) { Assert-RequiredModule -ModuleName 'PnP.PowerShell' }
+
+foreach ($module in $GraphModules) { Import-Module $module -ErrorAction Stop }
+if (-not $SkipSharePointUpload) { Import-Module PnP.PowerShell -ErrorAction Stop }
 
 # Connect to Microsoft Graph
 try {
-    Write-Log "Connecting to Microsoft Graph (TenantId: $TenantId | ClientId: $ClientId)..."
+    Write-Log "Connecting to Microsoft Graph (TenantId: $TenantId)..."
 
-    $connectParams = @{
-        TenantId  = $TenantId
-        ClientId  = $ClientId
-        NoWelcome = $true
-    }
+    $connectParams = @{ TenantId = $TenantId.ToString(); NoWelcome = $true }
 
-    if (-not [string]::IsNullOrWhiteSpace($CertificateThumbprint)) {
-        $connectParams['CertificateThumbprint'] = $CertificateThumbprint
-        Write-Log 'Authentication method: certificate thumbprint.'
+    if ($useAppOnlyAuth) {
+        $connectParams['ClientId'] = $ClientId
+
+        if ($thumbprintProvided) {
+            $connectParams['CertificateThumbprint'] = $CertificateThumbprint
+            Write-Log "Authentication method: certificate thumbprint."
+            Connect-MgGraph @connectParams
+        }
+        else {
+            Write-Log "Authentication method: certificate file ($CertificatePath)."
+            $cert = $null
+            try {
+                # EphemeralKeySet avoids writing the private key to disk on shared systems.
+                # Graph copies the key material at connect time, so the object is safe to dispose immediately after.
+                $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+                    $CertificatePath,
+                    $CertificatePassword,
+                    [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+                )
+                $connectParams['Certificate'] = $cert
+                Connect-MgGraph @connectParams
+            }
+            finally {
+                if ($null -ne $cert) { $cert.Dispose() }
+            }
+        }
     }
     else {
-        Write-Log "Authentication method: certificate file ($CertificatePath)."
-
-        # EphemeralKeySet avoids writing the private key to disk — important on shared systems
-        $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
-            $CertificatePath,
-            $CertificatePassword,
-            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
-        )
-        $connectParams['Certificate'] = $cert
+        $connectParams['Scopes'] = @('User.Read.All', 'AuditLog.Read.All')
+        Write-Log "Authentication method: interactive (delegated)."
+        Connect-MgGraph @connectParams
     }
 
-    Connect-MgGraph @connectParams
-    Write-Log 'Connected to Microsoft Graph successfully.'
+    Write-Log "Connected to Microsoft Graph successfully."
 }
 catch {
     Write-Log "Failed to connect to Microsoft Graph: $_" -Level Error
     exit 1
 }
 
-# Main execution block
+# Main data collection and export
+$hadError      = $false
+$exportedFiles = $null
 try {
     $activeUsers = Get-ActiveUsers
 
@@ -469,28 +558,43 @@ try {
         exit 0
     }
 
-    $signInData = Get-TeamsSignInData -DaysBack $DaysBack
-
-    Export-TeamReports -Users $activeUsers -SignInData $signInData
-
-    Write-Log '=========================================='
-    Write-Log ' Script completed successfully.'
-    Write-Log '=========================================='
+    $signInData    = Get-TeamsSignInData -DaysBack $DaysBack
+    $exportedFiles = Export-TeamsReports -Users $activeUsers -SignInData $signInData
 }
 catch {
     Write-Log "An unexpected error occurred: $_" -Level Error
     Write-Log $_.ScriptStackTrace -Level Error
-    exit 1
+    $hadError = $true
 }
 finally {
-    # Always disconnect, even on error
+    try { Disconnect-MgGraph | Out-Null; Write-Log "Disconnected from Microsoft Graph." }
+    catch { Write-Log "Could not disconnect from Microsoft Graph cleanly." -Level Warning }
+}
+
+if ($hadError) { exit 1 }
+
+# SharePoint upload
+if (-not $SkipSharePointUpload -and $null -ne $exportedFiles -and $exportedFiles.Count -gt 0) {
     try {
-        Disconnect-MgGraph | Out-Null
-        Write-Log 'Disconnected from Microsoft Graph.'
+        Invoke-SharePointUpload `
+            -ExportedFiles  $exportedFiles `
+            -UseAppOnlyAuth $useAppOnlyAuth `
+            -UseThumbprint  $thumbprintProvided
     }
     catch {
-        Write-Log 'Could not disconnect from Microsoft Graph cleanly.' -Level Warning
+        Write-Log "SharePoint upload failed: $_" -Level Error
+        exit 1
     }
 }
+elseif ($SkipSharePointUpload) {
+    Write-Log "SharePoint upload skipped (-SkipSharePointUpload)."
+}
+
+# Summary
+$duration = (Get-Date) - $scriptStartTime
+Write-Log "=== Script Completed ==="
+Write-Log "Duration  : $($duration.ToString('d\.hh\:mm\:ss'))"
+Write-Log "Reports   : $ReportBaseDir"
+Write-Log "Log File  : $LogFile"
 
 #endregion
