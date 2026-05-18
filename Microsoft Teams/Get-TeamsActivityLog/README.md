@@ -11,7 +11,9 @@ Both **interactive** (credential prompt / MFA) and **non-interactive** (saved cr
 The script connects to Microsoft Graph (app-only or interactive) and:
 
 1. Enumerates all **enabled, non-guest member accounts** from Entra ID.
-2. Queries **both interactive and non-interactive Entra ID sign-in audit logs** for successful Microsoft Teams authentications within the specified lookback window (default: 30 days). The most recent timestamp across both sources is used per user per platform.
+2. Queries **both interactive and non-interactive Entra ID sign-in audit logs** for successful Microsoft Teams authentications within their respective lookback windows (default: 30 days each). The most recent timestamp per source is tracked per user per platform.
+   - Interactive sign-ins are controlled by `-DaysBack` (1–30 days).
+   - Non-interactive sign-ins are controlled by `-NonInteractiveDaysBack` (D1, D7, D14, D30). A shorter window is recommended for large tenants as non-interactive events can be 10–50× more numerous.
 3. Classifies each sign-in as **Desktop** or **Mobile** based on the device operating system:
    - **Mobile**: iOS, Android, Windows Phone
    - **Desktop**: Windows, macOS, Linux, ChromeOS, and all other non-empty OS values
@@ -167,7 +169,8 @@ openssl pkcs12 -export \
 | `-CertificateThumbprint` | One of two | — | Certificate thumbprint from the local store |
 | `-CertificatePath` | One of two | — | Path to a `.pfx` certificate file |
 | `-CertificatePassword` | When using `-CertificatePath` | — | SecureString password for the `.pfx` |
-| `-DaysBack` | No | `30` | Sign-in log lookback window (1–30 days) |
+| `-DaysBack` | No | `30` | Interactive sign-in lookback window (1–30 days) |
+| `-NonInteractiveDaysBack` | No | `D30` | Non-interactive sign-in lookback window (`D1`, `D7`, `D14`, `D30`). Use a shorter value to reduce run time on large tenants. |
 | `-SharePointSiteUrl` | Unless `-SkipSharePointUpload` | — | Full SharePoint site URL |
 | `-SharePointDocumentLibrary` | No | `Documents` | Document library URL name |
 | `-SharePointBaseFolderPath` | No | `Teams Activity` | Base folder within the library |
@@ -205,6 +208,17 @@ $pwd = Read-Host -AsSecureString 'Certificate password'
     -DaysBack            14
 ```
 
+**Large tenant — shorter non-interactive window to reduce run time:**
+```powershell
+.\Get-TeamsActivityLog.ps1 `
+    -TenantId              'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
+    -ClientId              'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
+    -CertificateThumbprint 'ABCDEF1234567890ABCDEF1234567890ABCDEF12' `
+    -DaysBack              30 `
+    -NonInteractiveDaysBack D7 `
+    -SkipSharePointUpload
+```
+
 **Task Scheduler (unattended):**
 ```
 pwsh.exe -NonInteractive -File "C:\Scripts\Get-TeamsActivityLog\Get-TeamsActivityLog.ps1"
@@ -239,7 +253,11 @@ Documents/Teams Activity/FSHO/2026/05/FSHO-TeamsActivity-20260516.csv
 
 ### Performance on Large Tenants
 
-The script reads all Microsoft Teams sign-in records for the tenant across the lookback window. For large tenants this can result in hundreds of thousands of records and may take **10–30 minutes**. A progress counter is displayed during processing.
+The script reads all Microsoft Teams sign-in records for the tenant across the respective lookback windows. Non-interactive sign-in events (silent token refreshes) are generated continuously in the background and can be 10–50× more numerous than interactive sign-ins. For large tenants (10,000+ users), the non-interactive query can produce several million records and take several hours with the default 30-day window.
+
+**Recommended mitigation:** use `-NonInteractiveDaysBack D7` to limit the non-interactive query to 7 days. This typically reduces non-interactive record volume by ~75% while still providing a meaningful "last active" timestamp.
+
+A progress counter is displayed during processing.
 
 ### Teams Web Client
 
@@ -267,5 +285,5 @@ Rotate your certificate before it expires. Upload the new public key to the Entr
 | `AADSTS700027` — certificate not trusted | Certificate not uploaded to Entra app | Upload the `.cer` / `.crt` public key to **Certificates & secrets** |
 | `CryptographicException` on macOS | Wrong password or corrupted `.pfx` | Re-export the `.pfx` and verify the password |
 | SharePoint upload fails with 403 | App not granted site-level access | Run `Grant-PnPAzureADAppSitePermission` for this app and site |
-| Empty report (0 records) | No Teams sign-ins in the period | Increase `-DaysBack` or verify Teams is actively used |
+| Empty report (0 records) | No Teams sign-ins in the period | Increase `-DaysBack` / `-NonInteractiveDaysBack` or verify Teams is actively used |
 | Sign-in logs return 0 results | `AuditLog.Read.All` missing or no consent | Check API permissions and re-grant admin consent |

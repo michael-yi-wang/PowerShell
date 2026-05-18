@@ -81,8 +81,12 @@
 
 .NOTES
     Author:  Michael Wang
-    Version: 1.0
-    Date:    2026-05-11
+    Version: 1.1
+    Date:    2026-05-18
+
+    Change log:
+      1.1 - Added 3-attempt retry loop around Add-PnPFile to handle intermittent
+            SharePoint upload timeouts (HttpClient.Timeout 100 s default).
 
     Required Modules:
         Microsoft.Graph.Users
@@ -471,16 +475,18 @@ if (-not $SkipSharePointUpload) {
     Write-Log -Message "Connecting to SharePoint Online: $SharePointSiteUrl"
 
     try {
+        $pnpConnectParams = @{
+            Url = $SharePointSiteUrl
+        }
         if ($useAppOnlyAuth) {
-            Connect-PnPOnline `
-                -Url       $SharePointSiteUrl `
-                -ClientId  $ClientId `
-                -Thumbprint $CertificateThumbprint `
-                -Tenant    $TenantId.ToString()
+            $pnpConnectParams['ClientId']   = $ClientId
+            $pnpConnectParams['Thumbprint'] = $CertificateThumbprint
+            $pnpConnectParams['Tenant']     = $TenantId.ToString()
         }
         else {
-            Connect-PnPOnline -Url $SharePointSiteUrl -Interactive
+            $pnpConnectParams['Interactive'] = $true
         }
+        Connect-PnPOnline @pnpConnectParams
         Write-Log -Message "Connected to SharePoint Online."
     }
     catch {
@@ -520,12 +526,33 @@ if (-not $SkipSharePointUpload) {
 
         Write-Log -Message "Target SharePoint folder: $currentPath"
 
-        $csvFileName = Split-Path -Path $csvFile -Leaf
-        Write-Log -Message "Uploading '$csvFileName' to SharePoint..."
+        $csvFileName  = Split-Path -Path $csvFile -Leaf
+        $maxAttempts  = 3
+        $uploadDone   = $false
 
-        Add-PnPFile -Path $csvFile -Folder $currentPath | Out-Null
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            try {
+                Write-Log -Message "Uploading '$csvFileName' to SharePoint (attempt $attempt / $maxAttempts)..."
+                Add-PnPFile -Path $csvFile -Folder $currentPath -ErrorAction Stop | Out-Null
+                Write-Log -Message "Upload successful. SharePoint path: $currentPath/$csvFileName"
+                $uploadDone = $true
+                break
+            }
+            catch {
+                $isTimeout = $_.ToString() -match 'timeout|canceled|HttpClient|TaskCanceled'
+                if ($isTimeout -and $attempt -lt $maxAttempts) {
+                    Write-Log -Message "Upload timed out (attempt $attempt). Waiting 30s before retry..." -Level Warning
+                    Start-Sleep -Seconds 30
+                }
+                else {
+                    throw
+                }
+            }
+        }
 
-        Write-Log -Message "Upload successful. SharePoint path: $currentPath/$csvFileName"
+        if (-not $uploadDone) {
+            throw "Upload failed after $maxAttempts attempts."
+        }
     }
     catch {
         Write-Log -Message "Failed to upload file to SharePoint: $_" -Level Error

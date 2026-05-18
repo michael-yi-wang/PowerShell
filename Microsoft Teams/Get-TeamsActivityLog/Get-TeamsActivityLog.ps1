@@ -58,6 +58,13 @@
     {BaseFolderPath}/{OfficeLocation}/YYYY/MM/
     Default: "Teams Activity"
 
+.PARAMETER NonInteractiveDaysBack
+    Lookback window specifically for non-interactive sign-in logs.
+    Accepted values: D1, D7, D14, D30.
+    Non-interactive events (background token refreshes) can be 10–50× more numerous than
+    interactive ones; a shorter window significantly reduces run time on large tenants.
+    Default: D30 (matches -DaysBack).
+
 .PARAMETER SkipSharePointUpload
     Skip uploading reports to SharePoint Online. Useful for testing or local-only runs.
 
@@ -90,8 +97,8 @@
 
 .NOTES
     Author  : Michael Wang
-    Version : 2.4.0
-    Date    : 2026-05-16
+    Version : 2.5.3
+    Date    : 2026-05-17
 
     Required Microsoft Graph API Permissions (Application):
         User.Read.All
@@ -147,7 +154,11 @@ param (
     [string]$SharePointBaseFolderPath = "Teams Activity",
 
     [Parameter(Mandatory = $false, HelpMessage = "Skip uploading reports to SharePoint Online")]
-    [switch]$SkipSharePointUpload
+    [switch]$SkipSharePointUpload,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Lookback window for non-interactive sign-in logs (D1, D7, D14, D30)")]
+    [ValidateSet('D1', 'D7', 'D14', 'D30')]
+    [string]$NonInteractiveDaysBack = 'D30'
 )
 
 #region Initialization
@@ -248,16 +259,21 @@ function Get-ActiveUsers {
 
 function Get-TeamsSignInData {
     [CmdletBinding()]
-    param ([int]$DaysBack)
+    param (
+        [int]$DaysBack,
+        [int]$NonInteractiveDaysBack
+    )
 
-    Write-Log "Querying Teams sign-in logs (interactive + non-interactive) for the last $DaysBack day(s). This may take a while..."
+    Write-Log "Querying Teams sign-in logs: interactive last $DaysBack day(s), non-interactive last $NonInteractiveDaysBack day(s). This may take a while..."
 
-    # $startDate derives from Get-Date only — no user input reaches this filter.
-    $startDate   = (Get-Date).ToUniversalTime().AddDays(-$DaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
     # Use the stable well-known App ID for Microsoft Teams rather than appDisplayName,
     # which can silently return 0 results if the display name differs in the tenant.
-    $baseFilter   = "appId eq '1fec8e78-bce4-4aaf-ab1b-5451cc387264' and status/errorCode eq 0 and createdDateTime ge $startDate"
+    $teamsAppId   = '1fec8e78-bce4-4aaf-ab1b-5451cc387264'
+    $filterBase   = "appId eq '$teamsAppId' and status/errorCode eq 0"
     $selectFields = 'userId,createdDateTime,deviceDetail'
+
+    # Capture 'now' once so every chunk boundary is consistent across the run.
+    $now = (Get-Date).ToUniversalTime()
 
     # Four separate dictionaries — one per platform per auth type — so the report
     # shows interactive and non-interactive last logins as distinct columns.
@@ -272,22 +288,60 @@ function Get-TeamsSignInData {
     # Both sign-in types use the /signIns endpoint (beta required for signInEventTypes filter).
     # Non-interactive sign-ins are filtered via signInEventTypes/any(t: t eq 'nonInteractiveUser').
     # Ref: https://learn.microsoft.com/entra/identity/monitoring-health/howto-analyze-activity-logs-with-microsoft-graph
+    #
+    # The beta sign-in endpoint's skip token expires after ~7 minutes regardless of page count.
+    # Fix: cursor-based recovery — on skip-token expiry, catch the error and rebuild the query
+    # from the last successfully processed createdDateTime. $orderby=createdDateTime asc ensures
+    # records arrive in stable chronological order so the cursor is always safe to resume from.
+    # Records at the exact cursor timestamp may be re-processed on resume; this is harmless
+    # because the max-timestamp tracking per user is idempotent.
     $signInSources = @(
-        @{ Label = 'Interactive';     BaseUri = 'https://graph.microsoft.com/v1.0/auditLogs/signIns'; ODataFilter = $baseFilter;                                                                              DesktopDict = $desktopInteractive;    MobileDict = $mobileInteractive }
-        @{ Label = 'Non-Interactive'; BaseUri = 'https://graph.microsoft.com/beta/auditLogs/signIns'; ODataFilter = "$baseFilter and signInEventTypes/any(t: t eq 'nonInteractiveUser')"; DesktopDict = $desktopNonInteractive; MobileDict = $mobileNonInteractive }
+        @{
+            Label       = 'Interactive'
+            BaseUri     = 'https://graph.microsoft.com/v1.0/auditLogs/signIns'
+            ExtraFilter = ''
+            DaysBack    = $DaysBack
+            DesktopDict = $desktopInteractive
+            MobileDict  = $mobileInteractive
+        }
+        @{
+            Label       = 'Non-Interactive'
+            BaseUri     = 'https://graph.microsoft.com/beta/auditLogs/signIns'
+            ExtraFilter = " and signInEventTypes/any(t: t eq 'nonInteractiveUser')"
+            DaysBack    = $NonInteractiveDaysBack
+            DesktopDict = $desktopNonInteractive
+            MobileDict  = $mobileNonInteractive
+        }
     )
 
     try {
         foreach ($source in $signInSources) {
             Write-Log "Querying $($source.Label) sign-in logs..."
             $sourceCount = 0
+            $cursorStr   = $now.AddDays(-$source.DaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
 
-            $encodedFilter = [uri]::EscapeDataString($source.ODataFilter)
-            $uri = "$($source.BaseUri)?`$filter=$encodedFilter&`$select=$selectFields&`$top=999"
+            # Returns a fresh URI anchored at $fromStr, with stable ascending order.
+            $buildUri = {
+                param ([string]$fromStr)
+                $f = "$filterBase and createdDateTime ge $fromStr$($source.ExtraFilter)"
+                "$($source.BaseUri)?`$filter=$([uri]::EscapeDataString($f))&`$orderby=createdDateTime+asc&`$select=$selectFields&`$top=999"
+            }
+
+            $uri = & $buildUri $cursorStr
 
             try {
-                do {
-                    $response = Invoke-MgGraphRequest -Uri $uri -Method GET -OutputType PSObject -ErrorAction Stop
+                while ($true) {
+                    $response = $null
+                    try {
+                        $response = Invoke-MgGraphRequest -Uri $uri -Method GET -OutputType PSObject -ErrorAction Stop
+                    }
+                    catch {
+                        if ($_.ToString() -notlike '*Skip token*') { throw }
+                        # Skip token expired — resume from cursor without losing progress.
+                        Write-Log "  [$($source.Label)] Skip token expired; resuming from $cursorStr" -Level Warning
+                        $uri = & $buildUri $cursorStr
+                        continue
+                    }
 
                     foreach ($record in $response.value) {
                         $sourceCount++
@@ -297,6 +351,8 @@ function Get-TeamsSignInData {
                             $elapsed = [math]::Round($stopwatch.Elapsed.TotalSeconds, 0)
                             Write-Progress -Activity 'Processing Teams sign-in logs' `
                                 -Status "Records processed: $totalRecords (${elapsed}s elapsed)" -PercentComplete -1
+                        }
+                        if ($totalRecords % 10000 -eq 0) {
                             Write-Log "Processed $totalRecords sign-in records so far..."
                         }
 
@@ -309,6 +365,9 @@ function Get-TeamsSignInData {
                         $loginTime = [System.DateTimeOffset]::Parse($record.createdDateTime.ToString())
                         # Browser/web client sign-ins report no OS; treat as Desktop (web from a desktop).
                         if ([string]::IsNullOrWhiteSpace($os)) { $os = 'Web' }
+
+                        # Advance cursor so any resume starts from this record's timestamp.
+                        $cursorStr = $record.createdDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
 
                         if ($os -in $MobileOSList) {
                             if (-not $source.MobileDict.ContainsKey($userId) -or $loginTime -gt $source.MobileDict[$userId]) {
@@ -324,7 +383,8 @@ function Get-TeamsSignInData {
 
                     # PSObject.Properties lookup avoids strict-mode error when @odata.nextLink is absent on the last page.
                     $uri = $response.PSObject.Properties['@odata.nextLink']?.Value
-                } while ($uri)
+                    if (-not $uri) { break }
+                }
             }
             catch {
                 Write-Log "Error while retrieving $($source.Label) sign-in logs: $_" -Level Error
@@ -513,10 +573,11 @@ function Invoke-SharePointUpload {
 
 #region Main
 
-Write-Log "=== Get-TeamsActivityLog v2.4.0 ==="
-Write-Log "Start Time : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
-Write-Log "Days Back  : $DaysBack"
-Write-Log "Report Dir : $ReportBaseDir"
+Write-Log "=== Get-TeamsActivityLog v2.5.3 ==="
+Write-Log "Start Time      : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+Write-Log "Days Back       : $DaysBack (interactive)"
+Write-Log "NI Days Back    : $NonInteractiveDaysBack (non-interactive)"
+Write-Log "Report Dir      : $ReportBaseDir"
 
 # Validate SharePoint parameters
 if (-not $SkipSharePointUpload -and [string]::IsNullOrWhiteSpace($SharePointSiteUrl)) {
@@ -601,7 +662,8 @@ try {
         exit 0
     }
 
-    $signInData    = Get-TeamsSignInData -DaysBack $DaysBack
+    $niDays        = [int]$NonInteractiveDaysBack.TrimStart('D')
+    $signInData    = Get-TeamsSignInData -DaysBack $DaysBack -NonInteractiveDaysBack $niDays
     $exportedFiles = Export-TeamsReports -Users $activeUsers -SignInData $signInData
 }
 catch {
