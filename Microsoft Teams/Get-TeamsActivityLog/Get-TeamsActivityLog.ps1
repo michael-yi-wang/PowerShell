@@ -2,20 +2,15 @@
 
 <#
 .SYNOPSIS
-    Retrieves Microsoft Teams last sign-in activity for all active users, grouped by Office Location.
+    Retrieves the most recent Microsoft Teams sign-in date for all active users, grouped by Office Location.
 
 .DESCRIPTION
     Connects to Microsoft Graph (app-only or interactive) and retrieves Teams sign-in activity
     from Entra ID audit logs for all active, non-guest users in the tenant.
 
     Both interactive (credential prompt) and non-interactive (saved credentials / silent token
-    refresh) sign-ins are included so that users who launch Teams with saved credentials are
-    correctly reflected in the report.
-
-    Desktop vs Mobile classification is based on the sign-in device operating system:
-      - Mobile  : iOS, Android, Windows Phone
-      - Desktop : Windows, macOS, Linux, ChromeOS, and any sign-in with no OS reported
-                  (browser/web client sessions report no OS and are treated as Desktop)
+    refresh) sign-ins are included. The most recent sign-in across all device types and all
+    auth types is reported as a single TeamsLastLogin_UTC value per user.
 
     Results are grouped by Office Location and written to:
       <script_dir>/report/<OfficeLocation>/YYYY/MM/<OfficeLocation>-TeamsActivity-YYYYMMDD.csv
@@ -104,7 +99,7 @@
 
 .NOTES
     Author  : Michael Wang
-    Version : 2.7.0
+    Version : 2.8.0
     Date    : 2026-05-18
 
     Required Microsoft Graph API Permissions (Application):
@@ -169,7 +164,7 @@ param (
 
     [Parameter(Mandatory = $false, HelpMessage = "Number of parallel time-window chunks for non-interactive sign-in queries (1-10)")]
     [ValidateRange(1, 10)]
-    [int]$NonInteractiveParallelism = 5
+    [int]$NonInteractiveParallelism = 3
 )
 
 #region Initialization
@@ -192,8 +187,6 @@ if (-not (Test-Path $LogDirectory)) {
 }
 
 $LogFile = Join-Path $LogDirectory "Get-TeamsActivityLog_${RunDateTime}.log"
-
-$MobileOSList = @('iOS', 'Android', 'Windows Phone')
 
 $GraphModules = @(
     'Microsoft.Graph.Authentication',
@@ -280,7 +273,7 @@ function Get-TeamsSignInData {
 
     $teamsAppId   = '1fec8e78-bce4-4aaf-ab1b-5451cc387264'
     $filterBase   = "appId eq '$teamsAppId' and status/errorCode eq 0"
-    $selectFields = 'userId,createdDateTime,deviceDetail'
+    $selectFields = 'userId,createdDateTime'   # deviceDetail omitted — device type not required
     $now          = (Get-Date).ToUniversalTime()
     $totalRecords = 0
     $stopwatch    = [System.Diagnostics.Stopwatch]::StartNew()
@@ -297,8 +290,7 @@ function Get-TeamsSignInData {
     #
     # The NI window is divided into $NonInteractiveParallelism equal time slices, each queried
     # by a dedicated thread job. The interactive job runs concurrently. All jobs merge into
-    # two dictionaries (Desktop, Mobile) — the Interactive/Non-Interactive distinction is not
-    # preserved, since only per-device last-login is required.
+    # a single LastUsed dictionary — only the most recent sign-in across all types is kept.
 
     # 1 interactive source + N NI time-window chunks, all run in parallel.
     $allSources = [System.Collections.Generic.List[hashtable]]::new()
@@ -340,9 +332,6 @@ function Get-TeamsSignInData {
         throw "Unable to extract Bearer token from Graph response. Ensure Microsoft.Graph.Authentication 2.x is installed."
     }
 
-    # Snapshot script-scope variable into function scope so $using: can capture it.
-    $localMobileOSList = $MobileOSList
-
     # Launch both queries concurrently in thread jobs (same process, isolated runspaces).
     # $using: captures variables from the calling scope without type coercion — more
     # reliable than -ArgumentList with typed param() declarations across runspaces.
@@ -356,7 +345,6 @@ function Get-TeamsSignInData {
             $src          = $using:capturedSource
             $filterBase   = $using:filterBase
             $selectFields = $using:selectFields
-            $mobileOSList = $using:localMobileOSList
             $accessToken  = $using:accessToken
 
             # Builds a fresh query URI anchored at $fromStr.
@@ -367,14 +355,13 @@ function Get-TeamsSignInData {
                 "$($src.BaseUri)?`$filter=$([uri]::EscapeDataString($f))&`$orderby=createdDateTime+asc&`$select=$selectFields&`$top=999"
             }
 
-            $desktop   = [System.Collections.Generic.Dictionary[string, System.DateTimeOffset]]::new()
-            $mobile    = [System.Collections.Generic.Dictionary[string, System.DateTimeOffset]]::new()
+            $lastUsed      = [System.Collections.Generic.Dictionary[string, System.DateTimeOffset]]::new()
             $count         = 0
             $retries       = 0
             $throttleCount = 0
-            $cursorStr = $src.StartDate
-            $headers   = @{ Authorization = "Bearer $accessToken" }
-            $uri       = New-QueryUri $cursorStr
+            $cursorStr     = $src.StartDate
+            $headers       = @{ Authorization = "Bearer $accessToken" }
+            $uri           = New-QueryUri $cursorStr
 
             while ($true) {
                 $response = $null
@@ -411,20 +398,13 @@ function Get-TeamsSignInData {
                     $userId = $record.userId
                     if ([string]::IsNullOrWhiteSpace($userId)) { continue }
 
-                    # Parse once; reuse for both login time and cursor advancement.
                     [System.DateTimeOffset]$loginTime = [System.DateTimeOffset]::Parse($record.createdDateTime)
                     $ts = $loginTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
                     if ($ts -gt $cursorStr) { $cursorStr = $ts }
 
-                    $os = $null
-                    if ($null -ne $record.deviceDetail) { $os = $record.deviceDetail.operatingSystem }
-                    # Browser/web client sign-ins report no OS; treat as Desktop.
-                    if ([string]::IsNullOrWhiteSpace($os)) { $os = 'Web' }
-
-                    $dict = if ($os -in $mobileOSList) { $mobile } else { $desktop }
                     [System.DateTimeOffset]$existing = [System.DateTimeOffset]::MinValue
-                    if (-not $dict.TryGetValue($userId, [ref]$existing) -or $loginTime -gt $existing) {
-                        $dict[$userId] = $loginTime
+                    if (-not $lastUsed.TryGetValue($userId, [ref]$existing) -or $loginTime -gt $existing) {
+                        $lastUsed[$userId] = $loginTime
                     }
                 }
 
@@ -434,13 +414,11 @@ function Get-TeamsSignInData {
                 $uri = $nextLink
             }
 
-            # Implicit pipeline output — more reliable than 'return @{...}' for thread job scriptblocks.
             [PSCustomObject]@{
-                Label   = $src.Label
-                Desktop = $desktop
-                Mobile  = $mobile
-                Count   = $count
-                Retries = $retries
+                Label    = $src.Label
+                LastUsed = $lastUsed
+                Count    = $count
+                Retries  = $retries
             }
         }))
     }
@@ -461,11 +439,9 @@ function Get-TeamsSignInData {
         $stopwatch.Stop()
     }
 
-    # Collect results; merge all jobs into two dictionaries (Desktop, Mobile).
-    # All sign-in types (interactive + every NI chunk) contribute to the same max-timestamp
-    # per user per device category — Interactive/Non-Interactive is not distinguished.
-    $desktop = [System.Collections.Generic.Dictionary[string, System.DateTimeOffset]]::new()
-    $mobile  = [System.Collections.Generic.Dictionary[string, System.DateTimeOffset]]::new()
+    # Collect results; merge all jobs into a single LastUsed dictionary.
+    # The most recent sign-in across all types (interactive + all NI chunks) is kept per user.
+    $lastUsed = [System.Collections.Generic.Dictionary[string, System.DateTimeOffset]]::new()
 
     foreach ($job in $jobs) {
         $jobErrors = @()
@@ -491,30 +467,18 @@ function Get-TeamsSignInData {
         $totalRecords += $result.Count
         Write-Log "$($result.Label) complete. Records: $($result.Count)."
 
-        # Merge this job's Desktop results (keep max timestamp per user).
-        foreach ($kvp in $result.Desktop.GetEnumerator()) {
+        foreach ($kvp in $result.LastUsed.GetEnumerator()) {
             [System.DateTimeOffset]$existing = [System.DateTimeOffset]::MinValue
-            if (-not $desktop.TryGetValue($kvp.Key, [ref]$existing) -or $kvp.Value -gt $existing) {
-                $desktop[$kvp.Key] = $kvp.Value
-            }
-        }
-        # Merge this job's Mobile results (keep max timestamp per user).
-        foreach ($kvp in $result.Mobile.GetEnumerator()) {
-            [System.DateTimeOffset]$existing = [System.DateTimeOffset]::MinValue
-            if (-not $mobile.TryGetValue($kvp.Key, [ref]$existing) -or $kvp.Value -gt $existing) {
-                $mobile[$kvp.Key] = $kvp.Value
+            if (-not $lastUsed.TryGetValue($kvp.Key, [ref]$existing) -or $kvp.Value -gt $existing) {
+                $lastUsed[$kvp.Key] = $kvp.Value
             }
         }
     }
 
     Write-Log "Total sign-in records processed: $totalRecords."
-    Write-Log "Users with Teams Desktop activity : $($desktop.Count)"
-    Write-Log "Users with Teams Mobile activity  : $($mobile.Count)"
+    Write-Log "Users with any Teams activity: $($lastUsed.Count)"
 
-    return @{
-        Desktop = $desktop
-        Mobile  = $mobile
-    }
+    return @{ LastUsed = $lastUsed }
 }
 
 function Export-TeamsReports {
@@ -532,19 +496,17 @@ function Export-TeamsReports {
         $uid = $user.Id
 
         [System.DateTimeOffset]$dtExisting = [System.DateTimeOffset]::MinValue
-        $desktopLogin = if ($SignInData.Desktop.TryGetValue($uid, [ref]$dtExisting)) { $dtExisting.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
-        $mobileLogin  = if ($SignInData.Mobile.TryGetValue($uid,  [ref]$dtExisting)) { $dtExisting.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
+        $lastLogin = if ($SignInData.LastUsed.TryGetValue($uid, [ref]$dtExisting)) { $dtExisting.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
 
         $results.Add([PSCustomObject]@{
-            DisplayName              = $user.DisplayName
-            Email                    = if ($user.Mail) { $user.Mail } else { $user.UserPrincipalName }
-            UserPrincipalName        = $user.UserPrincipalName
-            OfficeLocation           = $user.OfficeLocation
-            Department               = $user.Department
-            Title                    = $user.JobTitle
-            AccountEnabled           = $user.AccountEnabled
-            TeamsDesktopLastLogin_UTC = $desktopLogin
-            TeamsMobileLastLogin_UTC  = $mobileLogin
+            DisplayName        = $user.DisplayName
+            Email              = if ($user.Mail) { $user.Mail } else { $user.UserPrincipalName }
+            UserPrincipalName  = $user.UserPrincipalName
+            OfficeLocation     = $user.OfficeLocation
+            Department         = $user.Department
+            Title              = $user.JobTitle
+            AccountEnabled     = $user.AccountEnabled
+            TeamsLastLogin_UTC = $lastLogin
         })
     }
 
@@ -674,7 +636,7 @@ function Invoke-SharePointUpload {
 
 #region Main
 
-Write-Log "=== Get-TeamsActivityLog v2.7.0 ==="
+Write-Log "=== Get-TeamsActivityLog v2.8.0 ==="
 Write-Log "Start Time      : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
 Write-Log "Days Back       : $DaysBack (interactive)"
 Write-Log "NI Days Back    : $NonInteractiveDaysBack in $NonInteractiveParallelism parallel chunk(s)"
