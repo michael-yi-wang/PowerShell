@@ -65,6 +65,13 @@
     interactive ones; a shorter window significantly reduces run time on large tenants.
     Default: D30 (matches -DaysBack).
 
+.PARAMETER NonInteractiveParallelism
+    Number of parallel time-window chunks for the non-interactive sign-in query (1–10).
+    The NI window is divided into this many equal slices, each queried by a dedicated
+    thread job. Higher values reduce elapsed time but increase Graph API throttle pressure
+    (the built-in retry logic handles throttling automatically).
+    Default: 5  (i.e. 5 NI chunks + 1 interactive job = 6 parallel jobs total).
+
 .PARAMETER SkipSharePointUpload
     Skip uploading reports to SharePoint Online. Useful for testing or local-only runs.
 
@@ -97,8 +104,8 @@
 
 .NOTES
     Author  : Michael Wang
-    Version : 2.5.3
-    Date    : 2026-05-17
+    Version : 2.7.0
+    Date    : 2026-05-18
 
     Required Microsoft Graph API Permissions (Application):
         User.Read.All
@@ -158,7 +165,11 @@ param (
 
     [Parameter(Mandatory = $false, HelpMessage = "Lookback window for non-interactive sign-in logs (D1, D7, D14, D30)")]
     [ValidateSet('D1', 'D7', 'D14', 'D30')]
-    [string]$NonInteractiveDaysBack = 'D30'
+    [string]$NonInteractiveDaysBack = 'D30',
+
+    [Parameter(Mandatory = $false, HelpMessage = "Number of parallel time-window chunks for non-interactive sign-in queries (1-10)")]
+    [ValidateRange(1, 10)]
+    [int]$NonInteractiveParallelism = 5
 )
 
 #region Initialization
@@ -261,27 +272,16 @@ function Get-TeamsSignInData {
     [CmdletBinding()]
     param (
         [int]$DaysBack,
-        [int]$NonInteractiveDaysBack
+        [int]$NonInteractiveDaysBack,
+        [int]$NonInteractiveParallelism
     )
 
-    Write-Log "Querying Teams sign-in logs: interactive last $DaysBack day(s), non-interactive last $NonInteractiveDaysBack day(s). This may take a while..."
+    Write-Log "Querying Teams sign-in logs: interactive last $DaysBack day(s), non-interactive last $NonInteractiveDaysBack day(s) in $NonInteractiveParallelism parallel chunk(s)..."
 
-    # Use the stable well-known App ID for Microsoft Teams rather than appDisplayName,
-    # which can silently return 0 results if the display name differs in the tenant.
     $teamsAppId   = '1fec8e78-bce4-4aaf-ab1b-5451cc387264'
     $filterBase   = "appId eq '$teamsAppId' and status/errorCode eq 0"
     $selectFields = 'userId,createdDateTime,deviceDetail'
-
-    # Capture 'now' once so every chunk boundary is consistent across the run.
-    $now = (Get-Date).ToUniversalTime()
-
-    # Four separate dictionaries — one per platform per auth type — so the report
-    # shows interactive and non-interactive last logins as distinct columns.
-    $desktopInteractive    = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
-    $desktopNonInteractive = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
-    $mobileInteractive     = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
-    $mobileNonInteractive  = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
-
+    $now          = (Get-Date).ToUniversalTime()
     $totalRecords = 0
     $stopwatch    = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -290,108 +290,170 @@ function Get-TeamsSignInData {
     # Ref: https://learn.microsoft.com/entra/identity/monitoring-health/howto-analyze-activity-logs-with-microsoft-graph
     #
     # The beta sign-in endpoint's skip token expires after ~7 minutes regardless of page count.
-    # Fix: cursor-based recovery — on skip-token expiry, catch the error and rebuild the query
-    # from the last successfully processed createdDateTime. $orderby=createdDateTime asc ensures
-    # records arrive in stable chronological order so the cursor is always safe to resume from.
+    # Cursor-based recovery: on skip-token expiry, rebuild the query from the last successfully
+    # processed createdDateTime. $orderby=createdDateTime asc ensures stable chronological order.
     # Records at the exact cursor timestamp may be re-processed on resume; this is harmless
     # because the max-timestamp tracking per user is idempotent.
-    $signInSources = @(
-        @{
-            Label       = 'Interactive'
-            BaseUri     = 'https://graph.microsoft.com/v1.0/auditLogs/signIns'
-            ExtraFilter = ''
-            DaysBack    = $DaysBack
-            DesktopDict = $desktopInteractive
-            MobileDict  = $mobileInteractive
-        }
-        @{
-            Label       = 'Non-Interactive'
+    #
+    # The NI window is divided into $NonInteractiveParallelism equal time slices, each queried
+    # by a dedicated thread job. The interactive job runs concurrently. All jobs merge into
+    # two dictionaries (Desktop, Mobile) — the Interactive/Non-Interactive distinction is not
+    # preserved, since only per-device last-login is required.
+
+    # 1 interactive source + N NI time-window chunks, all run in parallel.
+    $allSources = [System.Collections.Generic.List[hashtable]]::new()
+
+    $allSources.Add(@{
+        Label       = 'Interactive'
+        BaseUri     = 'https://graph.microsoft.com/v1.0/auditLogs/signIns'
+        ExtraFilter = ''
+        StartDate   = $now.AddDays(-$DaysBack).ToString('yyyy-MM-ddTHH:mm:ssZ')
+        EndDate     = $null
+    })
+
+    $chunkDays = $NonInteractiveDaysBack / $NonInteractiveParallelism
+    for ($i = 0; $i -lt $NonInteractiveParallelism; $i++) {
+        # Chunk 0 is the most recent slice; chunk N-1 is the oldest.
+        $chunkEnd   = $now.AddDays(-($i       * $chunkDays))
+        $chunkStart = $now.AddDays(-(($i + 1) * $chunkDays))
+        $allSources.Add(@{
+            Label       = "Non-Interactive ($($i+1)/$NonInteractiveParallelism)"
             BaseUri     = 'https://graph.microsoft.com/beta/auditLogs/signIns'
             ExtraFilter = " and signInEventTypes/any(t: t eq 'nonInteractiveUser')"
-            DaysBack    = $NonInteractiveDaysBack
-            DesktopDict = $desktopNonInteractive
-            MobileDict  = $mobileNonInteractive
-        }
-    )
+            StartDate   = $chunkStart.ToString('yyyy-MM-ddTHH:mm:ssZ')
+            # Most-recent chunk has no upper bound; all others end at the chunk boundary.
+            EndDate     = if ($i -eq 0) { $null } else { $chunkEnd.ToString('yyyy-MM-ddTHH:mm:ssZ') }
+        })
+    }
 
-    try {
-        foreach ($source in $signInSources) {
-            Write-Log "Querying $($source.Label) sign-in logs..."
-            $sourceCount = 0
-            $cursorStr   = $now.AddDays(-$source.DaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    # Thread job runspaces don't share the Graph module's per-runspace auth session.
+    # Extract a raw Bearer token once so each job can call the Graph REST API directly
+    # via Invoke-RestMethod without needing Connect-MgGraph inside the runspace.
+    Write-Log "Extracting Graph Bearer token for parallel thread jobs..."
+    $tokenProbe  = Invoke-MgGraphRequest `
+        -Uri "https://graph.microsoft.com/v1.0/users?`$top=1&`$select=id" `
+        -OutputType HttpResponseMessage -ErrorAction Stop
+    $accessToken = $tokenProbe.RequestMessage.Headers.Authorization.Parameter
+    $tokenProbe.Dispose()
 
-            # Returns a fresh URI anchored at $fromStr, with stable ascending order.
-            $buildUri = {
-                param ([string]$fromStr)
-                $f = "$filterBase and createdDateTime ge $fromStr$($source.ExtraFilter)"
-                "$($source.BaseUri)?`$filter=$([uri]::EscapeDataString($f))&`$orderby=createdDateTime+asc&`$select=$selectFields&`$top=999"
+    if ([string]::IsNullOrWhiteSpace($accessToken)) {
+        throw "Unable to extract Bearer token from Graph response. Ensure Microsoft.Graph.Authentication 2.x is installed."
+    }
+
+    # Snapshot script-scope variable into function scope so $using: can capture it.
+    $localMobileOSList = $MobileOSList
+
+    # Launch both queries concurrently in thread jobs (same process, isolated runspaces).
+    # $using: captures variables from the calling scope without type coercion — more
+    # reliable than -ArgumentList with typed param() declarations across runspaces.
+    # Each job outputs a [PSCustomObject] directly to the pipeline (implicit output is
+    # safer than 'return @{...}' for scriptblocks — avoids early-exit silent drop).
+    Write-Log "Launching $($allSources.Count) parallel sign-in query jobs (1 interactive + $NonInteractiveParallelism NI chunks)..."
+    $jobs = [System.Collections.Generic.List[object]]::new()
+    foreach ($source in $allSources) {
+        $capturedSource = $source   # Capture loop variable; $using: reads the value at job start.
+        $jobs.Add((Start-ThreadJob -Name "SignIn_$($capturedSource.Label)" -ScriptBlock {
+            $src          = $using:capturedSource
+            $filterBase   = $using:filterBase
+            $selectFields = $using:selectFields
+            $mobileOSList = $using:localMobileOSList
+            $accessToken  = $using:accessToken
+
+            # Builds a fresh query URI anchored at $fromStr.
+            # $src.EndDate (if set) caps the chunk to its time slice; omitted on the most-recent chunk.
+            function New-QueryUri ([string]$fromStr) {
+                $endClause = if ($src.EndDate) { " and createdDateTime lt $($src.EndDate)" } else { '' }
+                $f = "$filterBase and createdDateTime ge $fromStr$endClause$($src.ExtraFilter)"
+                "$($src.BaseUri)?`$filter=$([uri]::EscapeDataString($f))&`$orderby=createdDateTime+asc&`$select=$selectFields&`$top=999"
             }
 
-            $uri = & $buildUri $cursorStr
+            $desktop   = [System.Collections.Generic.Dictionary[string, System.DateTimeOffset]]::new()
+            $mobile    = [System.Collections.Generic.Dictionary[string, System.DateTimeOffset]]::new()
+            $count         = 0
+            $retries       = 0
+            $throttleCount = 0
+            $cursorStr = $src.StartDate
+            $headers   = @{ Authorization = "Bearer $accessToken" }
+            $uri       = New-QueryUri $cursorStr
 
-            try {
-                while ($true) {
-                    $response = $null
-                    try {
-                        $response = Invoke-MgGraphRequest -Uri $uri -Method GET -OutputType PSObject -ErrorAction Stop
-                    }
-                    catch {
-                        if ($_.ToString() -notlike '*Skip token*') { throw }
-                        # Skip token expired — resume from cursor without losing progress.
-                        Write-Log "  [$($source.Label)] Skip token expired; resuming from $cursorStr" -Level Warning
-                        $uri = & $buildUri $cursorStr
-                        continue
-                    }
-
-                    foreach ($record in $response.value) {
-                        $sourceCount++
-                        $totalRecords++
-
-                        if ($totalRecords % 500 -eq 0) {
-                            $elapsed = [math]::Round($stopwatch.Elapsed.TotalSeconds, 0)
-                            Write-Progress -Activity 'Processing Teams sign-in logs' `
-                                -Status "Records processed: $totalRecords (${elapsed}s elapsed)" -PercentComplete -1
-                        }
-                        if ($totalRecords % 10000 -eq 0) {
-                            Write-Log "Processed $totalRecords sign-in records so far..."
-                        }
-
-                        $userId = $record.userId
-                        if ([string]::IsNullOrWhiteSpace($userId)) { continue }
-
-                        $os = $record.deviceDetail?.operatingSystem
-                        # REST response returns createdDateTime as an ISO 8601 string; DateTimeOffset.Parse
-                        # handles the Z suffix correctly and produces a UTC offset.
-                        $loginTime = [System.DateTimeOffset]::Parse($record.createdDateTime.ToString())
-                        # Browser/web client sign-ins report no OS; treat as Desktop (web from a desktop).
-                        if ([string]::IsNullOrWhiteSpace($os)) { $os = 'Web' }
-
-                        # Advance cursor so any resume starts from this record's timestamp.
-                        $cursorStr = $record.createdDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
-
-                        if ($os -in $MobileOSList) {
-                            if (-not $source.MobileDict.ContainsKey($userId) -or $loginTime -gt $source.MobileDict[$userId]) {
-                                $source.MobileDict[$userId] = $loginTime
-                            }
-                        }
-                        else {
-                            if (-not $source.DesktopDict.ContainsKey($userId) -or $loginTime -gt $source.DesktopDict[$userId]) {
-                                $source.DesktopDict[$userId] = $loginTime
-                            }
-                        }
-                    }
-
-                    # PSObject.Properties lookup avoids strict-mode error when @odata.nextLink is absent on the last page.
-                    $uri = $response.PSObject.Properties['@odata.nextLink']?.Value
-                    if (-not $uri) { break }
+            while ($true) {
+                $response = $null
+                try {
+                    $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method GET -ErrorAction Stop
+                    $throttleCount = 0   # Reset consecutive throttle counter on success.
                 }
-            }
-            catch {
-                Write-Log "Error while retrieving $($source.Label) sign-in logs: $_" -Level Error
-                throw
+                catch {
+                    $msg = $_.ToString()
+
+                    # 429 Too Many Requests — respect Retry-After header, then retry same URI.
+                    if ($msg -like '*429*' -or $msg -like '*Too Many Requests*') {
+                        if ($throttleCount -ge 10) { throw "Graph API throttling persisted after 10 consecutive retries." }
+                        $throttleCount++
+                        $retryAfter = 60   # Conservative default; overridden by Retry-After header when present.
+                        try {
+                            $delta = $_.Exception.Response?.Headers?.RetryAfter?.Delta
+                            if ($null -ne $delta) { $retryAfter = [int]$delta.TotalSeconds + 5 }
+                        }
+                        catch { }
+                        Start-Sleep -Seconds $retryAfter
+                        continue   # Retry the same $uri; cursor has not advanced.
+                    }
+
+                    if ($msg -notlike '*Skip token*' -and $msg -notlike '*skipToken*') { throw }
+                    # Skip token expired — resume from cursor without losing progress.
+                    $retries++
+                    $uri = New-QueryUri $cursorStr
+                    continue
+                }
+
+                foreach ($record in $response.value) {
+                    $count++
+                    $userId = $record.userId
+                    if ([string]::IsNullOrWhiteSpace($userId)) { continue }
+
+                    # Parse once; reuse for both login time and cursor advancement.
+                    [System.DateTimeOffset]$loginTime = [System.DateTimeOffset]::Parse($record.createdDateTime)
+                    $ts = $loginTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
+                    if ($ts -gt $cursorStr) { $cursorStr = $ts }
+
+                    $os = $null
+                    if ($null -ne $record.deviceDetail) { $os = $record.deviceDetail.operatingSystem }
+                    # Browser/web client sign-ins report no OS; treat as Desktop.
+                    if ([string]::IsNullOrWhiteSpace($os)) { $os = 'Web' }
+
+                    $dict = if ($os -in $mobileOSList) { $mobile } else { $desktop }
+                    [System.DateTimeOffset]$existing = [System.DateTimeOffset]::MinValue
+                    if (-not $dict.TryGetValue($userId, [ref]$existing) -or $loginTime -gt $existing) {
+                        $dict[$userId] = $loginTime
+                    }
+                }
+
+                # PSObject.Properties lookup avoids strict-mode error when @odata.nextLink is absent.
+                $nextLink = $response.PSObject.Properties['@odata.nextLink']?.Value
+                if (-not $nextLink) { break }
+                $uri = $nextLink
             }
 
-            Write-Log "$($source.Label) sign-in log query complete. Records: $sourceCount."
+            # Implicit pipeline output — more reliable than 'return @{...}' for thread job scriptblocks.
+            [PSCustomObject]@{
+                Label   = $src.Label
+                Desktop = $desktop
+                Mobile  = $mobile
+                Count   = $count
+                Retries = $retries
+            }
+        }))
+    }
+
+    # Poll until all jobs finish, showing combined progress on the main thread.
+    try {
+        while ($jobs | Where-Object { $_.State -eq 'Running' }) {
+            $elapsed = [math]::Round($stopwatch.Elapsed.TotalSeconds, 0)
+            $done    = ($jobs | Where-Object { $_.State -notin 'Running', 'NotStarted' }).Count
+            Write-Progress -Activity 'Processing Teams sign-in logs' `
+                -Status "$done/$($jobs.Count) parallel queries complete (${elapsed}s elapsed)" `
+                -PercentComplete (($done / $jobs.Count) * 100)
+            Start-Sleep -Milliseconds 2000
         }
     }
     finally {
@@ -399,17 +461,59 @@ function Get-TeamsSignInData {
         $stopwatch.Stop()
     }
 
+    # Collect results; merge all jobs into two dictionaries (Desktop, Mobile).
+    # All sign-in types (interactive + every NI chunk) contribute to the same max-timestamp
+    # per user per device category — Interactive/Non-Interactive is not distinguished.
+    $desktop = [System.Collections.Generic.Dictionary[string, System.DateTimeOffset]]::new()
+    $mobile  = [System.Collections.Generic.Dictionary[string, System.DateTimeOffset]]::new()
+
+    foreach ($job in $jobs) {
+        $jobErrors = @()
+        $result    = Receive-Job -Job $job -Wait -ErrorVariable jobErrors -ErrorAction SilentlyContinue
+        $jobName   = $job.Name
+        $jobState  = $job.State
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+
+        if ($null -eq $result -or $jobState -eq 'Failed') {
+            $errMsg = if ($jobErrors.Count -gt 0) {
+                $jobErrors[0].Exception?.Message ?? $jobErrors[0].ToString()
+            } else {
+                "Job '$jobName' ($jobState) completed with no output. Check that the Bearer token is valid and the account has AuditLog.Read.All."
+            }
+            Write-Log "Sign-in query job '$jobName' failed: $errMsg" -Level Error
+            throw $errMsg
+        }
+
+        if ($result.Retries -gt 0) {
+            Write-Log "  [$($result.Label)] Skip-token expired and was recovered $($result.Retries) time(s)." -Level Warning
+        }
+
+        $totalRecords += $result.Count
+        Write-Log "$($result.Label) complete. Records: $($result.Count)."
+
+        # Merge this job's Desktop results (keep max timestamp per user).
+        foreach ($kvp in $result.Desktop.GetEnumerator()) {
+            [System.DateTimeOffset]$existing = [System.DateTimeOffset]::MinValue
+            if (-not $desktop.TryGetValue($kvp.Key, [ref]$existing) -or $kvp.Value -gt $existing) {
+                $desktop[$kvp.Key] = $kvp.Value
+            }
+        }
+        # Merge this job's Mobile results (keep max timestamp per user).
+        foreach ($kvp in $result.Mobile.GetEnumerator()) {
+            [System.DateTimeOffset]$existing = [System.DateTimeOffset]::MinValue
+            if (-not $mobile.TryGetValue($kvp.Key, [ref]$existing) -or $kvp.Value -gt $existing) {
+                $mobile[$kvp.Key] = $kvp.Value
+            }
+        }
+    }
+
     Write-Log "Total sign-in records processed: $totalRecords."
-    Write-Log "Users with Teams Desktop Interactive activity     : $($desktopInteractive.Count)"
-    Write-Log "Users with Teams Desktop Non-Interactive activity : $($desktopNonInteractive.Count)"
-    Write-Log "Users with Teams Mobile Interactive activity      : $($mobileInteractive.Count)"
-    Write-Log "Users with Teams Mobile Non-Interactive activity  : $($mobileNonInteractive.Count)"
+    Write-Log "Users with Teams Desktop activity : $($desktop.Count)"
+    Write-Log "Users with Teams Mobile activity  : $($mobile.Count)"
 
     return @{
-        DesktopInteractive    = $desktopInteractive
-        DesktopNonInteractive = $desktopNonInteractive
-        MobileInteractive     = $mobileInteractive
-        MobileNonInteractive  = $mobileNonInteractive
+        Desktop = $desktop
+        Mobile  = $mobile
     }
 }
 
@@ -427,23 +531,20 @@ function Export-TeamsReports {
     foreach ($user in $Users) {
         $uid = $user.Id
 
-        $desktopI    = if ($SignInData.DesktopInteractive.ContainsKey($uid))    { $SignInData.DesktopInteractive[$uid].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') }    else { $null }
-        $desktopNI   = if ($SignInData.DesktopNonInteractive.ContainsKey($uid)) { $SignInData.DesktopNonInteractive[$uid].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
-        $mobileI     = if ($SignInData.MobileInteractive.ContainsKey($uid))     { $SignInData.MobileInteractive[$uid].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') }     else { $null }
-        $mobileNI    = if ($SignInData.MobileNonInteractive.ContainsKey($uid))  { $SignInData.MobileNonInteractive[$uid].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') }  else { $null }
+        [System.DateTimeOffset]$dtExisting = [System.DateTimeOffset]::MinValue
+        $desktopLogin = if ($SignInData.Desktop.TryGetValue($uid, [ref]$dtExisting)) { $dtExisting.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
+        $mobileLogin  = if ($SignInData.Mobile.TryGetValue($uid,  [ref]$dtExisting)) { $dtExisting.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
 
         $results.Add([PSCustomObject]@{
-            DisplayName                              = $user.DisplayName
-            Email                                    = if ($user.Mail) { $user.Mail } else { $user.UserPrincipalName }
-            UserPrincipalName                        = $user.UserPrincipalName
-            OfficeLocation                           = $user.OfficeLocation
-            Department                               = $user.Department
-            Title                                    = $user.JobTitle
-            AccountEnabled                           = $user.AccountEnabled
-            TeamsDesktopInteractiveLastLogin_UTC     = $desktopI
-            TeamsDesktopNonInteractiveLastLogin_UTC  = $desktopNI
-            TeamsMobileInteractiveLastLogin_UTC      = $mobileI
-            TeamsMobileNonInteractiveLastLogin_UTC   = $mobileNI
+            DisplayName              = $user.DisplayName
+            Email                    = if ($user.Mail) { $user.Mail } else { $user.UserPrincipalName }
+            UserPrincipalName        = $user.UserPrincipalName
+            OfficeLocation           = $user.OfficeLocation
+            Department               = $user.Department
+            Title                    = $user.JobTitle
+            AccountEnabled           = $user.AccountEnabled
+            TeamsDesktopLastLogin_UTC = $desktopLogin
+            TeamsMobileLastLogin_UTC  = $mobileLogin
         })
     }
 
@@ -573,10 +674,10 @@ function Invoke-SharePointUpload {
 
 #region Main
 
-Write-Log "=== Get-TeamsActivityLog v2.5.3 ==="
+Write-Log "=== Get-TeamsActivityLog v2.7.0 ==="
 Write-Log "Start Time      : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
 Write-Log "Days Back       : $DaysBack (interactive)"
-Write-Log "NI Days Back    : $NonInteractiveDaysBack (non-interactive)"
+Write-Log "NI Days Back    : $NonInteractiveDaysBack in $NonInteractiveParallelism parallel chunk(s)"
 Write-Log "Report Dir      : $ReportBaseDir"
 
 # Validate SharePoint parameters
@@ -663,7 +764,7 @@ try {
     }
 
     $niDays        = [int]$NonInteractiveDaysBack.TrimStart('D')
-    $signInData    = Get-TeamsSignInData -DaysBack $DaysBack -NonInteractiveDaysBack $niDays
+    $signInData    = Get-TeamsSignInData -DaysBack $DaysBack -NonInteractiveDaysBack $niDays -NonInteractiveParallelism $NonInteractiveParallelism
     $exportedFiles = Export-TeamsReports -Users $activeUsers -SignInData $signInData
 }
 catch {
