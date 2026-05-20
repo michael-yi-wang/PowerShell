@@ -2,15 +2,16 @@
 
 <#
 .SYNOPSIS
-    Retrieves the most recent Microsoft Teams sign-in date for all active users, grouped by Office Location.
+    Retrieves the most recent Microsoft Teams activity date for all active users, grouped by Office Location.
 
 .DESCRIPTION
-    Connects to Microsoft Graph (app-only or interactive) and retrieves Teams sign-in activity
-    from Entra ID audit logs for all active, non-guest users in the tenant.
+    Connects to Microsoft Graph (app-only or interactive) and retrieves Teams user activity
+    from the Microsoft Graph Reports API for all active, non-guest users in the tenant.
 
-    Both interactive (credential prompt) and non-interactive (saved credentials / silent token
-    refresh) sign-ins are included. The most recent sign-in across all device types and all
-    auth types is reported as a single TeamsLastLogin_UTC value per user.
+    The Reports API returns a pre-aggregated "Last Activity Date" per user — the most recent
+    date on which the user participated in any Teams activity (chat, calls, meetings, etc.).
+    Device-type usage flags (Desktop, Mobile, Web) are sourced from the Teams Device Usage
+    report and indicate whether the user used that platform type at least once in the period.
 
     Results are grouped by Office Location and written to:
       <script_dir>/report/<OfficeLocation>/YYYY/MM/<OfficeLocation>-TeamsActivity-YYYYMMDD.csv
@@ -37,8 +38,10 @@
 .PARAMETER CertificatePassword
     SecureString password for the .pfx file. Required when -CertificatePath is used.
 
-.PARAMETER DaysBack
-    Number of days to look back in sign-in logs. Default: 30. Maximum: 30 for non-P2 tenants.
+.PARAMETER Period
+    Reporting period for both the activity and device usage reports.
+    Accepted values: D7, D30, D90, D180.
+    Default: D30.
 
 .PARAMETER SharePointSiteUrl
     Full SharePoint Online site URL.
@@ -53,58 +56,56 @@
     {BaseFolderPath}/{OfficeLocation}/YYYY/MM/
     Default: "Teams Activity"
 
-.PARAMETER NonInteractiveDaysBack
-    Lookback window specifically for non-interactive sign-in logs.
-    Accepted values: D1, D7, D14, D30.
-    Non-interactive events (background token refreshes) can be 10–50× more numerous than
-    interactive ones; a shorter window significantly reduces run time on large tenants.
-    Default: D30 (matches -DaysBack).
-
-.PARAMETER NonInteractiveParallelism
-    Number of parallel time-window chunks for the non-interactive sign-in query (1–10).
-    The NI window is divided into this many equal slices, each queried by a dedicated
-    thread job. Higher values reduce elapsed time but increase Graph API throttle pressure
-    (the built-in retry logic handles throttling automatically).
-    Default: 5  (i.e. 5 NI chunks + 1 interactive job = 6 parallel jobs total).
-
 .PARAMETER SkipSharePointUpload
     Skip uploading reports to SharePoint Online. Useful for testing or local-only runs.
 
 .EXAMPLE
-    # Interactive run — local report only
+    # Interactive run — local report only, 30-day period
     .\Get-TeamsActivityLog.ps1 `
         -TenantId         'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
         -SkipSharePointUpload
 
 .EXAMPLE
-    # App-only (certificate thumbprint) with SharePoint upload
+    # App-only (certificate thumbprint) with SharePoint upload, 90-day period
     .\Get-TeamsActivityLog.ps1 `
         -TenantId              'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
         -ClientId              'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
         -CertificateThumbprint 'ABCDEF1234567890ABCDEF1234567890ABCDEF12' `
+        -Period                D90 `
         -SharePointSiteUrl     'https://contoso.sharepoint.com/sites/IT' `
         -SharePointDocumentLibrary 'Documents' `
         -SharePointBaseFolderPath  'Teams Activity'
 
 .EXAMPLE
-    # App-only (PFX file, macOS) with SharePoint upload, 14-day lookback
+    # App-only (PFX file, macOS) with SharePoint upload, 7-day period
     $pwd = Read-Host -AsSecureString 'Certificate password'
     .\Get-TeamsActivityLog.ps1 `
         -TenantId            'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
         -ClientId            'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
         -CertificatePath     '/Users/admin/certs/app.pfx' `
         -CertificatePassword $pwd `
-        -SharePointSiteUrl   'https://contoso.sharepoint.com/sites/IT' `
-        -DaysBack            14
+        -Period              D7 `
+        -SharePointSiteUrl   'https://contoso.sharepoint.com/sites/IT'
 
 .NOTES
     Author  : Michael Wang
-    Version : 2.9.0
-    Date    : 2026-05-18
+    Version : 3.0.0
+    Date    : 2026-05-19
+
+    Breaking changes from v2.x:
+        - Removed -DaysBack, -NonInteractiveDaysBack, -NonInteractiveParallelism parameters
+        - Added -Period parameter (D7/D30/D90/D180; default D30)
+        - Removed TeamsDesktopLastLogin_UTC and TeamsMobileLastLogin_UTC output columns
+        - Renamed TeamsLastLogin_UTC to TeamsLastActivity_Date (date-only, YYYY-MM-DD)
+        - Added TeamsUsedDesktop, TeamsUsedMobile, TeamsUsedWeb output columns
 
     Required Microsoft Graph API Permissions (Application):
         User.Read.All
-        AuditLog.Read.All                (covers both interactive and non-interactive sign-in logs)
+        Reports.Read.All
+
+    Note: If the tenant has Microsoft 365 usage report anonymization enabled
+    (M365 Admin Center > Settings > Org Settings > Reports > Privacy), the Reports API
+    returns obfuscated user identifiers and the script will warn that data cannot be joined.
 
     SharePoint Permissions (when -SkipSharePointUpload is NOT specified):
         SharePoint API (Application): Sites.Selected
@@ -142,9 +143,9 @@ param (
     [Parameter(Mandatory = $false, HelpMessage = "SecureString password for the .pfx file")]
     [SecureString]$CertificatePassword,
 
-    [Parameter(Mandatory = $false, HelpMessage = "Number of days to look back in sign-in logs (1-30)")]
-    [ValidateRange(1, 30)]
-    [int]$DaysBack = 30,
+    [Parameter(Mandatory = $false, HelpMessage = "Reporting period for Teams activity and device usage reports (D7, D30, D90, D180)")]
+    [ValidateSet('D7', 'D30', 'D90', 'D180')]
+    [string]$Period = 'D30',
 
     [Parameter(Mandatory = $false, HelpMessage = "SharePoint Online site URL")]
     [string]$SharePointSiteUrl,
@@ -156,15 +157,7 @@ param (
     [string]$SharePointBaseFolderPath = "Teams Activity",
 
     [Parameter(Mandatory = $false, HelpMessage = "Skip uploading reports to SharePoint Online")]
-    [switch]$SkipSharePointUpload,
-
-    [Parameter(Mandatory = $false, HelpMessage = "Lookback window for non-interactive sign-in logs (D1, D7, D14, D30)")]
-    [ValidateSet('D1', 'D7', 'D14', 'D30')]
-    [string]$NonInteractiveDaysBack = 'D30',
-
-    [Parameter(Mandatory = $false, HelpMessage = "Number of parallel time-window chunks for non-interactive sign-in queries (1-10)")]
-    [ValidateRange(1, 10)]
-    [int]$NonInteractiveParallelism = 3
+    [switch]$SkipSharePointUpload
 )
 
 #region Initialization
@@ -192,8 +185,6 @@ $GraphModules = @(
     'Microsoft.Graph.Authentication',
     'Microsoft.Graph.Users'
 )
-
-$MobileOSList = @('iOS', 'Android', 'Windows Phone')
 
 #endregion
 
@@ -263,280 +254,146 @@ function Get-ActiveUsers {
     }
 }
 
-function Get-TeamsSignInData {
+function Invoke-TeamsReportDownload {
+    # Calls a Graph Reports API URI that returns a 302 redirect to a pre-authenticated
+    # CSV download URL, then downloads and returns the CSV text.
     [CmdletBinding()]
-    param (
-        [int]$DaysBack,
-        [int]$NonInteractiveDaysBack,
-        [int]$NonInteractiveParallelism
-    )
+    param ([string]$Uri, [string]$Label)
 
-    Write-Log "Querying Teams sign-in logs: interactive last $DaysBack day(s), non-interactive last $NonInteractiveDaysBack day(s) in $NonInteractiveParallelism parallel chunk(s)..."
+    Write-Log "Fetching $Label report..."
 
-    $teamsAppId   = '1fec8e78-bce4-4aaf-ab1b-5451cc387264'
-    $filterBase   = "appId eq '$teamsAppId' and status/errorCode eq 0"
-    $selectFields = 'userId,createdDateTime,deviceDetail'
-    $now          = (Get-Date).ToUniversalTime()
-    $totalRecords = 0
-    $stopwatch    = [System.Diagnostics.Stopwatch]::StartNew()
+    $httpResponse = Invoke-MgGraphRequest -Uri $Uri -OutputType HttpResponseMessage -ErrorAction Stop
+    $downloadUrl  = $null
 
-    # Both sign-in types use the /signIns endpoint (beta required for signInEventTypes filter).
-    # Non-interactive sign-ins are filtered via signInEventTypes/any(t: t eq 'nonInteractiveUser').
-    # Ref: https://learn.microsoft.com/entra/identity/monitoring-health/howto-analyze-activity-logs-with-microsoft-graph
-    #
-    # The beta sign-in endpoint's skip token expires after ~7 minutes regardless of page count.
-    # Cursor-based recovery: on skip-token expiry, rebuild the query from the last successfully
-    # processed createdDateTime. $orderby=createdDateTime asc ensures stable chronological order.
-    # Records at the exact cursor timestamp may be re-processed on resume; this is harmless
-    # because the max-timestamp tracking per user is idempotent.
-    #
-    # The NI window is divided into $NonInteractiveParallelism equal time slices, each queried
-    # by a dedicated thread job. The interactive job runs concurrently. All jobs merge into
-    # a single LastUsed dictionary — only the most recent sign-in across all types is kept.
-
-    # 1 interactive source + N NI time-window chunks, all run in parallel.
-    $allSources = [System.Collections.Generic.List[hashtable]]::new()
-
-    $allSources.Add(@{
-        Label       = 'Interactive'
-        BaseUri     = 'https://graph.microsoft.com/v1.0/auditLogs/signIns'
-        ExtraFilter = ''
-        StartDate   = $now.AddDays(-$DaysBack).ToString('yyyy-MM-ddTHH:mm:ssZ')
-        EndDate     = $null
-    })
-
-    $chunkDays = $NonInteractiveDaysBack / $NonInteractiveParallelism
-    for ($i = 0; $i -lt $NonInteractiveParallelism; $i++) {
-        # Chunk 0 is the most recent slice; chunk N-1 is the oldest.
-        $chunkEnd   = $now.AddDays(-($i       * $chunkDays))
-        $chunkStart = $now.AddDays(-(($i + 1) * $chunkDays))
-        $allSources.Add(@{
-            Label       = "Non-Interactive ($($i+1)/$NonInteractiveParallelism)"
-            BaseUri     = 'https://graph.microsoft.com/beta/auditLogs/signIns'
-            ExtraFilter = " and signInEventTypes/any(t: t eq 'nonInteractiveUser')"
-            StartDate   = $chunkStart.ToString('yyyy-MM-ddTHH:mm:ssZ')
-            # Most-recent chunk has no upper bound; all others end at the chunk boundary.
-            EndDate     = if ($i -eq 0) { $null } else { $chunkEnd.ToString('yyyy-MM-ddTHH:mm:ssZ') }
-        })
-    }
-
-    # Thread job runspaces don't share the Graph module's per-runspace auth session.
-    # Extract a raw Bearer token once so each job can call the Graph REST API directly
-    # via Invoke-RestMethod without needing Connect-MgGraph inside the runspace.
-    Write-Log "Extracting Graph Bearer token for parallel thread jobs..."
-    $tokenProbe  = Invoke-MgGraphRequest `
-        -Uri "https://graph.microsoft.com/v1.0/users?`$top=1&`$select=id" `
-        -OutputType HttpResponseMessage -ErrorAction Stop
-    $accessToken = $tokenProbe.RequestMessage.Headers.Authorization.Parameter
-    $tokenProbe.Dispose()
-
-    if ([string]::IsNullOrWhiteSpace($accessToken)) {
-        throw "Unable to extract Bearer token from Graph response. Ensure Microsoft.Graph.Authentication 2.x is installed."
-    }
-
-    # Snapshot script-scope variable into function scope so $using: can capture it.
-    $localMobileOSList = $MobileOSList
-
-    # Launch both queries concurrently in thread jobs (same process, isolated runspaces).
-    # $using: captures variables from the calling scope without type coercion — more
-    # reliable than -ArgumentList with typed param() declarations across runspaces.
-    # Each job outputs a [PSCustomObject] directly to the pipeline (implicit output is
-    # safer than 'return @{...}' for scriptblocks — avoids early-exit silent drop).
-    Write-Log "Launching $($allSources.Count) parallel sign-in query jobs (1 interactive + $NonInteractiveParallelism NI chunks)..."
-    $jobs = [System.Collections.Generic.List[object]]::new()
-    foreach ($source in $allSources) {
-        $capturedSource = $source   # Capture loop variable; $using: reads the value at job start.
-        $jobs.Add((Start-ThreadJob -Name "SignIn_$($capturedSource.Label)" -ScriptBlock {
-            $src          = $using:capturedSource
-            $filterBase   = $using:filterBase
-            $selectFields = $using:selectFields
-            $mobileOSList = $using:localMobileOSList
-            $accessToken  = $using:accessToken
-
-            # Builds a fresh query URI anchored at $fromStr.
-            # $src.EndDate (if set) caps the chunk to its time slice; omitted on the most-recent chunk.
-            function New-QueryUri ([string]$fromStr) {
-                $endClause = if ($src.EndDate) { " and createdDateTime lt $($src.EndDate)" } else { '' }
-                $f = "$filterBase and createdDateTime ge $fromStr$endClause$($src.ExtraFilter)"
-                "$($src.BaseUri)?`$filter=$([uri]::EscapeDataString($f))&`$orderby=createdDateTime+asc&`$select=$selectFields&`$top=999"
-            }
-
-            $desktop       = [System.Collections.Generic.Dictionary[string, System.DateTimeOffset]]::new()
-            $mobile        = [System.Collections.Generic.Dictionary[string, System.DateTimeOffset]]::new()
-            $count         = 0
-            $retries       = 0
-            $throttleCount = 0
-            $cursorStr     = $src.StartDate
-            $headers       = @{ Authorization = "Bearer $accessToken" }
-            $uri           = New-QueryUri $cursorStr
-
-            while ($true) {
-                $response = $null
-                try {
-                    $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method GET -ErrorAction Stop
-                    $throttleCount = 0   # Reset consecutive throttle counter on success.
-                }
-                catch {
-                    $msg = $_.ToString()
-
-                    # 429 Too Many Requests — respect Retry-After header, then retry same URI.
-                    if ($msg -like '*429*' -or $msg -like '*Too Many Requests*') {
-                        if ($throttleCount -ge 10) { throw "Graph API throttling persisted after 10 consecutive retries." }
-                        $throttleCount++
-                        $retryAfter = 60   # Conservative default; overridden by Retry-After header when present.
-                        try {
-                            $delta = $_.Exception.Response?.Headers?.RetryAfter?.Delta
-                            if ($null -ne $delta) { $retryAfter = [int]$delta.TotalSeconds + 5 }
-                        }
-                        catch { }
-                        Start-Sleep -Seconds $retryAfter
-                        continue   # Retry the same $uri; cursor has not advanced.
-                    }
-
-                    if ($msg -notlike '*Skip token*' -and $msg -notlike '*skipToken*') { throw }
-                    # Skip token expired — resume from cursor without losing progress.
-                    $retries++
-                    $uri = New-QueryUri $cursorStr
-                    continue
-                }
-
-                foreach ($record in $response.value) {
-                    $count++
-                    $userId = $record.userId
-                    if ([string]::IsNullOrWhiteSpace($userId)) { continue }
-
-                    [System.DateTimeOffset]$loginTime = [System.DateTimeOffset]::Parse($record.createdDateTime)
-                    $ts = $loginTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
-                    if ($ts -gt $cursorStr) { $cursorStr = $ts }
-
-                    $os = $null
-                    if ($null -ne $record.deviceDetail) { $os = $record.deviceDetail.operatingSystem }
-                    if ([string]::IsNullOrWhiteSpace($os)) { $os = 'Web' }
-
-                    $dict = if ($os -in $mobileOSList) { $mobile } else { $desktop }
-                    [System.DateTimeOffset]$existing = [System.DateTimeOffset]::MinValue
-                    if (-not $dict.TryGetValue($userId, [ref]$existing) -or $loginTime -gt $existing) {
-                        $dict[$userId] = $loginTime
-                    }
-                }
-
-                # PSObject.Properties lookup avoids strict-mode error when @odata.nextLink is absent.
-                $nextLink = $response.PSObject.Properties['@odata.nextLink']?.Value
-                if (-not $nextLink) { break }
-                $uri = $nextLink
-            }
-
-            [PSCustomObject]@{
-                Label   = $src.Label
-                Desktop = $desktop
-                Mobile  = $mobile
-                Count   = $count
-                Retries = $retries
-            }
-        }))
-    }
-
-    # Poll until all jobs finish, showing combined progress on the main thread.
     try {
-        while ($jobs | Where-Object { $_.State -eq 'Running' }) {
-            $elapsed = [math]::Round($stopwatch.Elapsed.TotalSeconds, 0)
-            $done    = ($jobs | Where-Object { $_.State -notin 'Running', 'NotStarted' }).Count
-            Write-Progress -Activity 'Processing Teams sign-in logs' `
-                -Status "$done/$($jobs.Count) parallel queries complete (${elapsed}s elapsed)" `
-                -PercentComplete (($done / $jobs.Count) * 100)
-            Start-Sleep -Milliseconds 2000
+        $statusCode = [int]$httpResponse.StatusCode
+
+        if ($statusCode -eq 302 -or $statusCode -eq 301) {
+            $downloadUrl = $httpResponse.Headers.Location.AbsoluteUri
+        }
+        elseif ($statusCode -eq 200) {
+            # SDK followed the redirect automatically — read content directly.
+            $content = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            return $content
+        }
+        else {
+            throw "Unexpected HTTP $statusCode from Graph Reports API ($Label)."
         }
     }
     finally {
-        Write-Progress -Activity 'Processing Teams sign-in logs' -Completed
-        $stopwatch.Stop()
+        $httpResponse.Dispose()
     }
 
-    # Collect results; merge all jobs into Desktop and Mobile dictionaries.
-    # The most recent sign-in per device category is kept across all jobs.
-    $desktop = [System.Collections.Generic.Dictionary[string, System.DateTimeOffset]]::new()
-    $mobile  = [System.Collections.Generic.Dictionary[string, System.DateTimeOffset]]::new()
+    # Pre-authenticated download URL — no Authorization header needed.
+    $csvText = Invoke-RestMethod -Uri $downloadUrl -Method GET -ErrorAction Stop
+    return $csvText
+}
 
-    foreach ($job in $jobs) {
-        $jobErrors = @()
-        $result    = Receive-Job -Job $job -Wait -ErrorVariable jobErrors -ErrorAction SilentlyContinue
-        $jobName   = $job.Name
-        $jobState  = $job.State
-        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+function Get-TeamsActivityReport {
+    [CmdletBinding()]
+    param ([string]$Period)
 
-        if ($null -eq $result -or $jobState -eq 'Failed') {
-            $errMsg = if ($jobErrors.Count -gt 0) {
-                $jobErrors[0].Exception?.Message ?? $jobErrors[0].ToString()
-            } else {
-                "Job '$jobName' ($jobState) completed with no output. Check that the Bearer token is valid and the account has AuditLog.Read.All."
-            }
-            Write-Log "Sign-in query job '$jobName' failed: $errMsg" -Level Error
-            throw $errMsg
-        }
+    $uri = "https://graph.microsoft.com/v1.0/reports/getTeamsUserActivityUserDetail(period='$Period')"
+    $csvText = Invoke-TeamsReportDownload -Uri $uri -Label "Teams User Activity ($Period)"
 
-        if ($result.Retries -gt 0) {
-            Write-Log "  [$($result.Label)] Skip-token expired and was recovered $($result.Retries) time(s)." -Level Warning
-        }
+    $lookup = [System.Collections.Generic.Dictionary[string, string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
 
-        $totalRecords += $result.Count
-        Write-Log "$($result.Label) complete. Records: $($result.Count)."
+    $rows = $csvText | ConvertFrom-Csv
+    $sampleId = ($rows | Where-Object { -not [string]::IsNullOrWhiteSpace($_.'User Id') } | Select-Object -First 1).'User Id'
 
-        foreach ($kvp in $result.Desktop.GetEnumerator()) {
-            [System.DateTimeOffset]$existing = [System.DateTimeOffset]::MinValue
-            if (-not $desktop.TryGetValue($kvp.Key, [ref]$existing) -or $kvp.Value -gt $existing) {
-                $desktop[$kvp.Key] = $kvp.Value
-            }
-        }
-        foreach ($kvp in $result.Mobile.GetEnumerator()) {
-            [System.DateTimeOffset]$existing = [System.DateTimeOffset]::MinValue
-            if (-not $mobile.TryGetValue($kvp.Key, [ref]$existing) -or $kvp.Value -gt $existing) {
-                $mobile[$kvp.Key] = $kvp.Value
-            }
+    # Warn if tenant anonymization is active (User Id won't be a real GUID).
+    if (-not [string]::IsNullOrWhiteSpace($sampleId) -and
+        $sampleId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        Write-Log "Teams activity report user IDs appear anonymized. Enable user-level detail in M365 Admin Center > Settings > Org Settings > Reports." -Level Warning
+    }
+
+    foreach ($row in $rows) {
+        if ($row.'Is Deleted' -eq 'True') { continue }
+        $userId    = $row.'User Id'
+        $lastDate  = $row.'Last Activity Date'
+        if ([string]::IsNullOrWhiteSpace($userId) -or [string]::IsNullOrWhiteSpace($lastDate)) { continue }
+        $lookup[$userId] = $lastDate
+    }
+
+    Write-Log "Teams activity report: $($lookup.Count) user(s) with activity in the last $Period."
+    return $lookup
+}
+
+function Get-TeamsDeviceUsageReport {
+    [CmdletBinding()]
+    param ([string]$Period)
+
+    $uri = "https://graph.microsoft.com/v1.0/reports/getTeamsDeviceUsageUserDetail(period='$Period')"
+    $csvText = Invoke-TeamsReportDownload -Uri $uri -Label "Teams Device Usage ($Period)"
+
+    $lookup = [System.Collections.Generic.Dictionary[string, hashtable]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+
+    $rows = $csvText | ConvertFrom-Csv
+
+    # Log the actual column names on the first row — the API omits columns with no tenant data,
+    # and column names can vary. This helps diagnose mismatches when all flags appear False.
+    $firstRow = $rows | Select-Object -First 1
+    if ($null -ne $firstRow) {
+        Write-Log "Device usage report columns: $($firstRow.PSObject.Properties.Name -join ' | ')"
+    }
+
+    foreach ($row in $rows) {
+        if ($row.'Is Deleted' -eq 'True') { continue }
+        $userId = $row.'User Id'
+        if ([string]::IsNullOrWhiteSpace($userId)) { continue }
+
+        # Convert row to a plain hashtable so missing columns return $null without
+        # triggering Set-StrictMode errors. Hashtable key lookup is case-sensitive,
+        # so keys are added exactly as they appear in the CSV header.
+        $r = @{}
+        foreach ($prop in $row.PSObject.Properties) { $r[$prop.Name] = $prop.Value }
+
+        $lookup[$userId] = @{
+            UsedDesktop = ($r['Used Windows'] -eq 'True' -or $r['Used Mac'] -eq 'True' -or
+                           $r['Used Chrome OS'] -eq 'True' -or $r['Used Linux'] -eq 'True')
+            UsedMobile  = ($r['Used iOS'] -eq 'True' -or $r['Used Android Phone'] -eq 'True' -or
+                           $r['Used Windows Phone'] -eq 'True')
+            UsedWeb     = ($r['Used Web'] -eq 'True')
         }
     }
 
-    Write-Log "Total sign-in records processed: $totalRecords."
-    Write-Log "Users with Teams Desktop activity : $($desktop.Count)"
-    Write-Log "Users with Teams Mobile activity  : $($mobile.Count)"
-
-    return @{ Desktop = $desktop; Mobile = $mobile }
+    Write-Log "Teams device usage report: $($lookup.Count) user(s) with device data in the last $Period."
+    return $lookup
 }
 
 function Export-TeamsReports {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)] [object[]]$Users,
-        [Parameter(Mandatory = $true)] [hashtable]$SignInData
+        [Parameter(Mandatory = $true)] [hashtable]$ActivityData
     )
 
     Write-Log 'Building report records...'
 
-    $results = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $activityDates = $ActivityData.ActivityDates
+    $deviceUsage   = $ActivityData.DeviceUsage
+    $results       = [System.Collections.Generic.List[PSCustomObject]]::new()
 
     foreach ($user in $Users) {
         $uid = $user.Id
 
-        [System.DateTimeOffset]$desktopDt = [System.DateTimeOffset]::MinValue
-        [System.DateTimeOffset]$mobileDt  = [System.DateTimeOffset]::MinValue
-        $hasDesktop = $SignInData.Desktop.TryGetValue($uid, [ref]$desktopDt)
-        $hasMobile  = $SignInData.Mobile.TryGetValue($uid,  [ref]$mobileDt)
-
-        $desktopLogin = if ($hasDesktop) { $desktopDt.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
-        $mobileLogin  = if ($hasMobile)  { $mobileDt.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') }  else { $null }
-        $lastDt       = if ($desktopDt -gt $mobileDt) { $desktopDt } else { $mobileDt }
-        $lastLogin    = if ($lastDt -gt [System.DateTimeOffset]::MinValue) { $lastDt.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
+        $lastDate    = if ($activityDates.ContainsKey($uid)) { $activityDates[$uid] } else { $null }
+        $deviceFlags = if ($deviceUsage.ContainsKey($uid))   { $deviceUsage[$uid]   } else { $null }
 
         $results.Add([PSCustomObject]@{
-            DisplayName               = $user.DisplayName
-            Email                     = if ($user.Mail) { $user.Mail } else { $user.UserPrincipalName }
-            UserPrincipalName         = $user.UserPrincipalName
-            OfficeLocation            = $user.OfficeLocation
-            Department                = $user.Department
-            Title                     = $user.JobTitle
-            AccountEnabled            = $user.AccountEnabled
-            TeamsLastLogin_UTC        = $lastLogin
-            TeamsDesktopLastLogin_UTC = $desktopLogin
-            TeamsMobileLastLogin_UTC  = $mobileLogin
+            DisplayName            = $user.DisplayName
+            Email                  = if ($user.Mail) { $user.Mail } else { $user.UserPrincipalName }
+            UserPrincipalName      = $user.UserPrincipalName
+            OfficeLocation         = $user.OfficeLocation
+            Department             = $user.Department
+            Title                  = $user.JobTitle
+            AccountEnabled         = $user.AccountEnabled
+            TeamsLastActivity_Date = $lastDate
+            TeamsUsedDesktop       = if ($null -ne $deviceFlags) { $deviceFlags.UsedDesktop } else { $null }
+            TeamsUsedMobile        = if ($null -ne $deviceFlags) { $deviceFlags.UsedMobile }  else { $null }
+            TeamsUsedWeb           = if ($null -ne $deviceFlags) { $deviceFlags.UsedWeb }     else { $null }
         })
     }
 
@@ -666,11 +523,10 @@ function Invoke-SharePointUpload {
 
 #region Main
 
-Write-Log "=== Get-TeamsActivityLog v2.9.0 ==="
-Write-Log "Start Time      : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
-Write-Log "Days Back       : $DaysBack (interactive)"
-Write-Log "NI Days Back    : $NonInteractiveDaysBack in $NonInteractiveParallelism parallel chunk(s)"
-Write-Log "Report Dir      : $ReportBaseDir"
+Write-Log "=== Get-TeamsActivityLog v3.0.0 ==="
+Write-Log "Start Time  : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+Write-Log "Period      : $Period"
+Write-Log "Report Dir  : $ReportBaseDir"
 
 # Validate SharePoint parameters
 if (-not $SkipSharePointUpload -and [string]::IsNullOrWhiteSpace($SharePointSiteUrl)) {
@@ -689,7 +545,7 @@ if ($certPathProvided -and $null -eq $CertificatePassword) {
 }
 
 $useAppOnlyAuth = $clientIdProvided -and ($thumbprintProvided -or $certPathProvided)
-Write-Log "Auth Mode  : $(if ($useAppOnlyAuth) { 'App-Only (Certificate)' } else { 'Interactive (Delegated)' })"
+Write-Log "Auth Mode   : $(if ($useAppOnlyAuth) { 'App-Only (Certificate)' } else { 'Interactive (Delegated)' })"
 
 # Validate required modules
 foreach ($module in $GraphModules) { Assert-RequiredModule -ModuleName $module }
@@ -732,7 +588,7 @@ try {
         }
     }
     else {
-        $connectParams['Scopes'] = @('User.Read.All', 'AuditLog.Read.All')
+        $connectParams['Scopes'] = @('User.Read.All', 'Reports.Read.All')
         Write-Log "Authentication method: interactive (delegated)."
         Connect-MgGraph @connectParams
     }
@@ -755,9 +611,13 @@ try {
         exit 0
     }
 
-    $niDays        = [int]$NonInteractiveDaysBack.TrimStart('D')
-    $signInData    = Get-TeamsSignInData -DaysBack $DaysBack -NonInteractiveDaysBack $niDays -NonInteractiveParallelism $NonInteractiveParallelism
-    $exportedFiles = Export-TeamsReports -Users $activeUsers -SignInData $signInData
+    $activityDates = Get-TeamsActivityReport    -Period $Period
+    $deviceUsage   = Get-TeamsDeviceUsageReport -Period $Period
+
+    $exportedFiles = Export-TeamsReports -Users $activeUsers -ActivityData @{
+        ActivityDates = $activityDates
+        DeviceUsage   = $deviceUsage
+    }
 }
 catch {
     Write-Log "An unexpected error occurred: $_" -Level Error
