@@ -89,7 +89,7 @@
 
 .NOTES
     Author  : Michael Wang
-    Version : 3.0.0
+    Version : 3.0.1
     Date    : 2026-05-19
 
     Breaking changes from v2.x:
@@ -332,30 +332,26 @@ function Get-TeamsDeviceUsageReport {
 
     $rows = $csvText | ConvertFrom-Csv
 
-    # Log the actual column names on the first row — the API omits columns with no tenant data,
-    # and column names can vary. This helps diagnose mismatches when all flags appear False.
-    $firstRow = $rows | Select-Object -First 1
-    if ($null -ne $firstRow) {
-        Write-Log "Device usage report columns: $($firstRow.PSObject.Properties.Name -join ' | ')"
-    }
-
     foreach ($row in $rows) {
         if ($row.'Is Deleted' -eq 'True') { continue }
         $userId = $row.'User Id'
         if ([string]::IsNullOrWhiteSpace($userId)) { continue }
 
         # Convert row to a plain hashtable so missing columns return $null without
-        # triggering Set-StrictMode errors. Hashtable key lookup is case-sensitive,
-        # so keys are added exactly as they appear in the CSV header.
+        # triggering Set-StrictMode errors. Column names are normalised (consecutive
+        # whitespace collapsed to a single space) to handle API typos such as
+        # "Used  Chrome OS" (two spaces) returned by getTeamsDeviceUsageUserDetail.
         $r = @{}
-        foreach ($prop in $row.PSObject.Properties) { $r[$prop.Name] = $prop.Value }
+        foreach ($prop in $row.PSObject.Properties) {
+            $r[($prop.Name -replace '\s+', ' ')] = $prop.Value
+        }
 
         $lookup[$userId] = @{
-            UsedDesktop = ($r['Used Windows'] -eq 'True' -or $r['Used Mac'] -eq 'True' -or
-                           $r['Used Chrome OS'] -eq 'True' -or $r['Used Linux'] -eq 'True')
-            UsedMobile  = ($r['Used iOS'] -eq 'True' -or $r['Used Android Phone'] -eq 'True' -or
-                           $r['Used Windows Phone'] -eq 'True')
-            UsedWeb     = ($r['Used Web'] -eq 'True')
+            UsedDesktop = ($r['Used Windows'] -eq 'Yes' -or $r['Used Mac'] -eq 'Yes' -or
+                           $r['Used Chrome OS'] -eq 'Yes' -or $r['Used Linux'] -eq 'Yes')
+            UsedMobile  = ($r['Used iOS'] -eq 'Yes' -or $r['Used Android Phone'] -eq 'Yes' -or
+                           $r['Used Windows Phone'] -eq 'Yes')
+            UsedWeb     = ($r['Used Web'] -eq 'Yes')
         }
     }
 
@@ -523,7 +519,7 @@ function Invoke-SharePointUpload {
 
 #region Main
 
-Write-Log "=== Get-TeamsActivityLog v3.0.0 ==="
+Write-Log "=== Get-TeamsActivityLog v3.0.1 ==="
 Write-Log "Start Time  : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
 Write-Log "Period      : $Period"
 Write-Log "Report Dir  : $ReportBaseDir"

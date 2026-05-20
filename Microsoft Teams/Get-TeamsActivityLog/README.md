@@ -46,14 +46,14 @@ The script connects to Microsoft Graph (app-only or interactive) and:
 | `Department` | Department from Entra ID profile |
 | `Title` | Job title from Entra ID profile |
 | `AccountEnabled` | Whether the account is enabled in Entra ID |
-| `TeamsLastActivity_Date` | Most recent date the user had any Teams activity (`YYYY-MM-DD`). Empty if no activity in the period. |
-| `TeamsUsedDesktop` | `True` if the user used Teams on Windows, macOS, Linux, or ChromeOS during the period |
-| `TeamsUsedMobile` | `True` if the user used Teams on iOS or Android during the period |
-| `TeamsUsedWeb` | `True` if the user used the Teams web client during the period |
+| `TeamsLastActivity_Date` | Most recent date the user had any Teams activity (`YYYY-MM-DD`), across all time — not limited to the selected period. Empty if the user has never had any Teams activity. |
+| `TeamsUsedDesktop` | `True` if the user used Teams on Windows, macOS, Linux, or ChromeOS **within the selected period** |
+| `TeamsUsedMobile` | `True` if the user used Teams on iOS or Android **within the selected period** |
+| `TeamsUsedWeb` | `True` if the user used the Teams web client **within the selected period** |
 
-> **Note:** `TeamsLastActivity_Date` is a **date** (not a timestamp) as provided by the Microsoft Graph Reports API. Device-type columns reflect whether a platform was used **at any point** during the period — not the last date for each platform specifically.
+> **Note:** `TeamsLastActivity_Date` is a **date** (not a timestamp) and reflects the user's **all-time** last activity — a user last active 6 months ago will still show that date even with `-Period D30`. The device-type columns (`TeamsUsedDesktop`, `TeamsUsedMobile`, `TeamsUsedWeb`) are scoped to the selected period and will be `False` if the user did not use that platform type within the period, even if they were active overall.
 
-Empty cells mean the user had **no Teams activity** during the selected period.
+Empty `TeamsLastActivity_Date` means the user has **never had any Teams activity** (or has never been licensed for Teams).
 
 ---
 
@@ -296,6 +296,7 @@ Rotate your certificate before it expires. Upload the new public key to the Entr
 
 | Version | Date | Notes |
 |---|---|---|
+| 3.0.1 | 2026-05-19 | Fixed device usage flags always showing False: API returns `Yes`/`No` values, not `True`/`False` as documented. Fixed strict-mode crash on absent CSV columns (e.g. `Used Chrome OS` omitted by some tenants). Fixed column name normalisation for API double-space typo in `Used  Chrome OS`. |
 | 3.0.0 | 2026-05-19 | Switched data source from Entra ID sign-in audit logs to Graph Reports API. Replaced `-DaysBack` / `-NonInteractiveDaysBack` / `-NonInteractiveParallelism` with `-Period`. Replaced `TeamsDesktopLastLogin_UTC` / `TeamsMobileLastLogin_UTC` / `TeamsLastLogin_UTC` columns with `TeamsLastActivity_Date`, `TeamsUsedDesktop`, `TeamsUsedMobile`, `TeamsUsedWeb`. Permission changed from `AuditLog.Read.All` to `Reports.Read.All`. Lookback extended to 180 days. |
 | 2.9.0 | 2026-05-18 | Restored Desktop/Mobile columns alongside combined `TeamsLastLogin_UTC`. |
 | 2.8.0 | 2026-05-17 | Simplified output to single `TeamsLastLogin_UTC`; reduced default parallelism. |
