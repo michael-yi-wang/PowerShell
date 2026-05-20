@@ -2,20 +2,16 @@
 
 <#
 .SYNOPSIS
-    Retrieves Microsoft Teams last sign-in activity for all active users, grouped by Office Location.
+    Retrieves the most recent Microsoft Teams activity date for all active users, grouped by Office Location.
 
 .DESCRIPTION
-    Connects to Microsoft Graph (app-only or interactive) and retrieves Teams sign-in activity
-    from Entra ID audit logs for all active, non-guest users in the tenant.
+    Connects to Microsoft Graph (app-only or interactive) and retrieves Teams user activity
+    from the Microsoft Graph Reports API for all active, non-guest users in the tenant.
 
-    Both interactive (credential prompt) and non-interactive (saved credentials / silent token
-    refresh) sign-ins are included so that users who launch Teams with saved credentials are
-    correctly reflected in the report.
-
-    Desktop vs Mobile classification is based on the sign-in device operating system:
-      - Mobile  : iOS, Android, Windows Phone
-      - Desktop : Windows, macOS, Linux, ChromeOS, and any sign-in with no OS reported
-                  (browser/web client sessions report no OS and are treated as Desktop)
+    The Reports API returns a pre-aggregated "Last Activity Date" per user — the most recent
+    date on which the user participated in any Teams activity (chat, calls, meetings, etc.).
+    Device-type usage flags (Desktop, Mobile, Web) are sourced from the Teams Device Usage
+    report and indicate whether the user used that platform type at least once in the period.
 
     Results are grouped by Office Location and written to:
       <script_dir>/report/<OfficeLocation>/YYYY/MM/<OfficeLocation>-TeamsActivity-YYYYMMDD.csv
@@ -42,8 +38,10 @@
 .PARAMETER CertificatePassword
     SecureString password for the .pfx file. Required when -CertificatePath is used.
 
-.PARAMETER DaysBack
-    Number of days to look back in sign-in logs. Default: 30. Maximum: 30 for non-P2 tenants.
+.PARAMETER Period
+    Reporting period for both the activity and device usage reports.
+    Accepted values: D7, D30, D90, D180.
+    Default: D30.
 
 .PARAMETER SharePointSiteUrl
     Full SharePoint Online site URL.
@@ -58,51 +56,56 @@
     {BaseFolderPath}/{OfficeLocation}/YYYY/MM/
     Default: "Teams Activity"
 
-.PARAMETER NonInteractiveDaysBack
-    Lookback window specifically for non-interactive sign-in logs.
-    Accepted values: D1, D7, D14, D30.
-    Non-interactive events (background token refreshes) can be 10–50× more numerous than
-    interactive ones; a shorter window significantly reduces run time on large tenants.
-    Default: D30 (matches -DaysBack).
-
 .PARAMETER SkipSharePointUpload
     Skip uploading reports to SharePoint Online. Useful for testing or local-only runs.
 
 .EXAMPLE
-    # Interactive run — local report only
+    # Interactive run — local report only, 30-day period
     .\Get-TeamsActivityLog.ps1 `
         -TenantId         'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
         -SkipSharePointUpload
 
 .EXAMPLE
-    # App-only (certificate thumbprint) with SharePoint upload
+    # App-only (certificate thumbprint) with SharePoint upload, 90-day period
     .\Get-TeamsActivityLog.ps1 `
         -TenantId              'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
         -ClientId              'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
         -CertificateThumbprint 'ABCDEF1234567890ABCDEF1234567890ABCDEF12' `
+        -Period                D90 `
         -SharePointSiteUrl     'https://contoso.sharepoint.com/sites/IT' `
         -SharePointDocumentLibrary 'Documents' `
         -SharePointBaseFolderPath  'Teams Activity'
 
 .EXAMPLE
-    # App-only (PFX file, macOS) with SharePoint upload, 14-day lookback
+    # App-only (PFX file, macOS) with SharePoint upload, 7-day period
     $pwd = Read-Host -AsSecureString 'Certificate password'
     .\Get-TeamsActivityLog.ps1 `
         -TenantId            'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
         -ClientId            'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
         -CertificatePath     '/Users/admin/certs/app.pfx' `
         -CertificatePassword $pwd `
-        -SharePointSiteUrl   'https://contoso.sharepoint.com/sites/IT' `
-        -DaysBack            14
+        -Period              D7 `
+        -SharePointSiteUrl   'https://contoso.sharepoint.com/sites/IT'
 
 .NOTES
     Author  : Michael Wang
-    Version : 2.5.3
-    Date    : 2026-05-17
+    Version : 3.0.1
+    Date    : 2026-05-19
+
+    Breaking changes from v2.x:
+        - Removed -DaysBack, -NonInteractiveDaysBack, -NonInteractiveParallelism parameters
+        - Added -Period parameter (D7/D30/D90/D180; default D30)
+        - Removed TeamsDesktopLastLogin_UTC and TeamsMobileLastLogin_UTC output columns
+        - Renamed TeamsLastLogin_UTC to TeamsLastActivity_Date (date-only, YYYY-MM-DD)
+        - Added TeamsUsedDesktop, TeamsUsedMobile, TeamsUsedWeb output columns
 
     Required Microsoft Graph API Permissions (Application):
         User.Read.All
-        AuditLog.Read.All                (covers both interactive and non-interactive sign-in logs)
+        Reports.Read.All
+
+    Note: If the tenant has Microsoft 365 usage report anonymization enabled
+    (M365 Admin Center > Settings > Org Settings > Reports > Privacy), the Reports API
+    returns obfuscated user identifiers and the script will warn that data cannot be joined.
 
     SharePoint Permissions (when -SkipSharePointUpload is NOT specified):
         SharePoint API (Application): Sites.Selected
@@ -140,9 +143,9 @@ param (
     [Parameter(Mandatory = $false, HelpMessage = "SecureString password for the .pfx file")]
     [SecureString]$CertificatePassword,
 
-    [Parameter(Mandatory = $false, HelpMessage = "Number of days to look back in sign-in logs (1-30)")]
-    [ValidateRange(1, 30)]
-    [int]$DaysBack = 30,
+    [Parameter(Mandatory = $false, HelpMessage = "Reporting period for Teams activity and device usage reports (D7, D30, D90, D180)")]
+    [ValidateSet('D7', 'D30', 'D90', 'D180')]
+    [string]$Period = 'D30',
 
     [Parameter(Mandatory = $false, HelpMessage = "SharePoint Online site URL")]
     [string]$SharePointSiteUrl,
@@ -154,11 +157,7 @@ param (
     [string]$SharePointBaseFolderPath = "Teams Activity",
 
     [Parameter(Mandatory = $false, HelpMessage = "Skip uploading reports to SharePoint Online")]
-    [switch]$SkipSharePointUpload,
-
-    [Parameter(Mandatory = $false, HelpMessage = "Lookback window for non-interactive sign-in logs (D1, D7, D14, D30)")]
-    [ValidateSet('D1', 'D7', 'D14', 'D30')]
-    [string]$NonInteractiveDaysBack = 'D30'
+    [switch]$SkipSharePointUpload
 )
 
 #region Initialization
@@ -181,8 +180,6 @@ if (-not (Test-Path $LogDirectory)) {
 }
 
 $LogFile = Join-Path $LogDirectory "Get-TeamsActivityLog_${RunDateTime}.log"
-
-$MobileOSList = @('iOS', 'Android', 'Windows Phone')
 
 $GraphModules = @(
     'Microsoft.Graph.Authentication',
@@ -257,193 +254,142 @@ function Get-ActiveUsers {
     }
 }
 
-function Get-TeamsSignInData {
+function Invoke-TeamsReportDownload {
+    # Calls a Graph Reports API URI that returns a 302 redirect to a pre-authenticated
+    # CSV download URL, then downloads and returns the CSV text.
     [CmdletBinding()]
-    param (
-        [int]$DaysBack,
-        [int]$NonInteractiveDaysBack
-    )
+    param ([string]$Uri, [string]$Label)
 
-    Write-Log "Querying Teams sign-in logs: interactive last $DaysBack day(s), non-interactive last $NonInteractiveDaysBack day(s). This may take a while..."
+    Write-Log "Fetching $Label report..."
 
-    # Use the stable well-known App ID for Microsoft Teams rather than appDisplayName,
-    # which can silently return 0 results if the display name differs in the tenant.
-    $teamsAppId   = '1fec8e78-bce4-4aaf-ab1b-5451cc387264'
-    $filterBase   = "appId eq '$teamsAppId' and status/errorCode eq 0"
-    $selectFields = 'userId,createdDateTime,deviceDetail'
-
-    # Capture 'now' once so every chunk boundary is consistent across the run.
-    $now = (Get-Date).ToUniversalTime()
-
-    # Four separate dictionaries — one per platform per auth type — so the report
-    # shows interactive and non-interactive last logins as distinct columns.
-    $desktopInteractive    = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
-    $desktopNonInteractive = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
-    $mobileInteractive     = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
-    $mobileNonInteractive  = [System.Collections.Generic.Dictionary[string, DateTimeOffset]]::new()
-
-    $totalRecords = 0
-    $stopwatch    = [System.Diagnostics.Stopwatch]::StartNew()
-
-    # Both sign-in types use the /signIns endpoint (beta required for signInEventTypes filter).
-    # Non-interactive sign-ins are filtered via signInEventTypes/any(t: t eq 'nonInteractiveUser').
-    # Ref: https://learn.microsoft.com/entra/identity/monitoring-health/howto-analyze-activity-logs-with-microsoft-graph
-    #
-    # The beta sign-in endpoint's skip token expires after ~7 minutes regardless of page count.
-    # Fix: cursor-based recovery — on skip-token expiry, catch the error and rebuild the query
-    # from the last successfully processed createdDateTime. $orderby=createdDateTime asc ensures
-    # records arrive in stable chronological order so the cursor is always safe to resume from.
-    # Records at the exact cursor timestamp may be re-processed on resume; this is harmless
-    # because the max-timestamp tracking per user is idempotent.
-    $signInSources = @(
-        @{
-            Label       = 'Interactive'
-            BaseUri     = 'https://graph.microsoft.com/v1.0/auditLogs/signIns'
-            ExtraFilter = ''
-            DaysBack    = $DaysBack
-            DesktopDict = $desktopInteractive
-            MobileDict  = $mobileInteractive
-        }
-        @{
-            Label       = 'Non-Interactive'
-            BaseUri     = 'https://graph.microsoft.com/beta/auditLogs/signIns'
-            ExtraFilter = " and signInEventTypes/any(t: t eq 'nonInteractiveUser')"
-            DaysBack    = $NonInteractiveDaysBack
-            DesktopDict = $desktopNonInteractive
-            MobileDict  = $mobileNonInteractive
-        }
-    )
+    $httpResponse = Invoke-MgGraphRequest -Uri $Uri -OutputType HttpResponseMessage -ErrorAction Stop
+    $downloadUrl  = $null
 
     try {
-        foreach ($source in $signInSources) {
-            Write-Log "Querying $($source.Label) sign-in logs..."
-            $sourceCount = 0
-            $cursorStr   = $now.AddDays(-$source.DaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $statusCode = [int]$httpResponse.StatusCode
 
-            # Returns a fresh URI anchored at $fromStr, with stable ascending order.
-            $buildUri = {
-                param ([string]$fromStr)
-                $f = "$filterBase and createdDateTime ge $fromStr$($source.ExtraFilter)"
-                "$($source.BaseUri)?`$filter=$([uri]::EscapeDataString($f))&`$orderby=createdDateTime+asc&`$select=$selectFields&`$top=999"
-            }
-
-            $uri = & $buildUri $cursorStr
-
-            try {
-                while ($true) {
-                    $response = $null
-                    try {
-                        $response = Invoke-MgGraphRequest -Uri $uri -Method GET -OutputType PSObject -ErrorAction Stop
-                    }
-                    catch {
-                        if ($_.ToString() -notlike '*Skip token*') { throw }
-                        # Skip token expired — resume from cursor without losing progress.
-                        Write-Log "  [$($source.Label)] Skip token expired; resuming from $cursorStr" -Level Warning
-                        $uri = & $buildUri $cursorStr
-                        continue
-                    }
-
-                    foreach ($record in $response.value) {
-                        $sourceCount++
-                        $totalRecords++
-
-                        if ($totalRecords % 500 -eq 0) {
-                            $elapsed = [math]::Round($stopwatch.Elapsed.TotalSeconds, 0)
-                            Write-Progress -Activity 'Processing Teams sign-in logs' `
-                                -Status "Records processed: $totalRecords (${elapsed}s elapsed)" -PercentComplete -1
-                        }
-                        if ($totalRecords % 10000 -eq 0) {
-                            Write-Log "Processed $totalRecords sign-in records so far..."
-                        }
-
-                        $userId = $record.userId
-                        if ([string]::IsNullOrWhiteSpace($userId)) { continue }
-
-                        $os = $record.deviceDetail?.operatingSystem
-                        # REST response returns createdDateTime as an ISO 8601 string; DateTimeOffset.Parse
-                        # handles the Z suffix correctly and produces a UTC offset.
-                        $loginTime = [System.DateTimeOffset]::Parse($record.createdDateTime.ToString())
-                        # Browser/web client sign-ins report no OS; treat as Desktop (web from a desktop).
-                        if ([string]::IsNullOrWhiteSpace($os)) { $os = 'Web' }
-
-                        # Advance cursor so any resume starts from this record's timestamp.
-                        $cursorStr = $record.createdDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
-
-                        if ($os -in $MobileOSList) {
-                            if (-not $source.MobileDict.ContainsKey($userId) -or $loginTime -gt $source.MobileDict[$userId]) {
-                                $source.MobileDict[$userId] = $loginTime
-                            }
-                        }
-                        else {
-                            if (-not $source.DesktopDict.ContainsKey($userId) -or $loginTime -gt $source.DesktopDict[$userId]) {
-                                $source.DesktopDict[$userId] = $loginTime
-                            }
-                        }
-                    }
-
-                    # PSObject.Properties lookup avoids strict-mode error when @odata.nextLink is absent on the last page.
-                    $uri = $response.PSObject.Properties['@odata.nextLink']?.Value
-                    if (-not $uri) { break }
-                }
-            }
-            catch {
-                Write-Log "Error while retrieving $($source.Label) sign-in logs: $_" -Level Error
-                throw
-            }
-
-            Write-Log "$($source.Label) sign-in log query complete. Records: $sourceCount."
+        if ($statusCode -eq 302 -or $statusCode -eq 301) {
+            $downloadUrl = $httpResponse.Headers.Location.AbsoluteUri
+        }
+        elseif ($statusCode -eq 200) {
+            # SDK followed the redirect automatically — read content directly.
+            $content = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            return $content
+        }
+        else {
+            throw "Unexpected HTTP $statusCode from Graph Reports API ($Label)."
         }
     }
     finally {
-        Write-Progress -Activity 'Processing Teams sign-in logs' -Completed
-        $stopwatch.Stop()
+        $httpResponse.Dispose()
     }
 
-    Write-Log "Total sign-in records processed: $totalRecords."
-    Write-Log "Users with Teams Desktop Interactive activity     : $($desktopInteractive.Count)"
-    Write-Log "Users with Teams Desktop Non-Interactive activity : $($desktopNonInteractive.Count)"
-    Write-Log "Users with Teams Mobile Interactive activity      : $($mobileInteractive.Count)"
-    Write-Log "Users with Teams Mobile Non-Interactive activity  : $($mobileNonInteractive.Count)"
+    # Pre-authenticated download URL — no Authorization header needed.
+    $csvText = Invoke-RestMethod -Uri $downloadUrl -Method GET -ErrorAction Stop
+    return $csvText
+}
 
-    return @{
-        DesktopInteractive    = $desktopInteractive
-        DesktopNonInteractive = $desktopNonInteractive
-        MobileInteractive     = $mobileInteractive
-        MobileNonInteractive  = $mobileNonInteractive
+function Get-TeamsActivityReport {
+    [CmdletBinding()]
+    param ([string]$Period)
+
+    $uri = "https://graph.microsoft.com/v1.0/reports/getTeamsUserActivityUserDetail(period='$Period')"
+    $csvText = Invoke-TeamsReportDownload -Uri $uri -Label "Teams User Activity ($Period)"
+
+    $lookup = [System.Collections.Generic.Dictionary[string, string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+
+    $rows = $csvText | ConvertFrom-Csv
+    $sampleId = ($rows | Where-Object { -not [string]::IsNullOrWhiteSpace($_.'User Id') } | Select-Object -First 1).'User Id'
+
+    # Warn if tenant anonymization is active (User Id won't be a real GUID).
+    if (-not [string]::IsNullOrWhiteSpace($sampleId) -and
+        $sampleId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        Write-Log "Teams activity report user IDs appear anonymized. Enable user-level detail in M365 Admin Center > Settings > Org Settings > Reports." -Level Warning
     }
+
+    foreach ($row in $rows) {
+        if ($row.'Is Deleted' -eq 'True') { continue }
+        $userId    = $row.'User Id'
+        $lastDate  = $row.'Last Activity Date'
+        if ([string]::IsNullOrWhiteSpace($userId) -or [string]::IsNullOrWhiteSpace($lastDate)) { continue }
+        $lookup[$userId] = $lastDate
+    }
+
+    Write-Log "Teams activity report: $($lookup.Count) user(s) with activity in the last $Period."
+    return $lookup
+}
+
+function Get-TeamsDeviceUsageReport {
+    [CmdletBinding()]
+    param ([string]$Period)
+
+    $uri = "https://graph.microsoft.com/v1.0/reports/getTeamsDeviceUsageUserDetail(period='$Period')"
+    $csvText = Invoke-TeamsReportDownload -Uri $uri -Label "Teams Device Usage ($Period)"
+
+    $lookup = [System.Collections.Generic.Dictionary[string, hashtable]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+
+    $rows = $csvText | ConvertFrom-Csv
+
+    foreach ($row in $rows) {
+        if ($row.'Is Deleted' -eq 'True') { continue }
+        $userId = $row.'User Id'
+        if ([string]::IsNullOrWhiteSpace($userId)) { continue }
+
+        # Convert row to a plain hashtable so missing columns return $null without
+        # triggering Set-StrictMode errors. Column names are normalised (consecutive
+        # whitespace collapsed to a single space) to handle API typos such as
+        # "Used  Chrome OS" (two spaces) returned by getTeamsDeviceUsageUserDetail.
+        $r = @{}
+        foreach ($prop in $row.PSObject.Properties) {
+            $r[($prop.Name -replace '\s+', ' ')] = $prop.Value
+        }
+
+        $lookup[$userId] = @{
+            UsedDesktop = ($r['Used Windows'] -eq 'Yes' -or $r['Used Mac'] -eq 'Yes' -or
+                           $r['Used Chrome OS'] -eq 'Yes' -or $r['Used Linux'] -eq 'Yes')
+            UsedMobile  = ($r['Used iOS'] -eq 'Yes' -or $r['Used Android Phone'] -eq 'Yes' -or
+                           $r['Used Windows Phone'] -eq 'Yes')
+            UsedWeb     = ($r['Used Web'] -eq 'Yes')
+        }
+    }
+
+    Write-Log "Teams device usage report: $($lookup.Count) user(s) with device data in the last $Period."
+    return $lookup
 }
 
 function Export-TeamsReports {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)] [object[]]$Users,
-        [Parameter(Mandatory = $true)] [hashtable]$SignInData
+        [Parameter(Mandatory = $true)] [hashtable]$ActivityData
     )
 
     Write-Log 'Building report records...'
 
-    $results = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $activityDates = $ActivityData.ActivityDates
+    $deviceUsage   = $ActivityData.DeviceUsage
+    $results       = [System.Collections.Generic.List[PSCustomObject]]::new()
 
     foreach ($user in $Users) {
         $uid = $user.Id
 
-        $desktopI    = if ($SignInData.DesktopInteractive.ContainsKey($uid))    { $SignInData.DesktopInteractive[$uid].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') }    else { $null }
-        $desktopNI   = if ($SignInData.DesktopNonInteractive.ContainsKey($uid)) { $SignInData.DesktopNonInteractive[$uid].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
-        $mobileI     = if ($SignInData.MobileInteractive.ContainsKey($uid))     { $SignInData.MobileInteractive[$uid].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') }     else { $null }
-        $mobileNI    = if ($SignInData.MobileNonInteractive.ContainsKey($uid))  { $SignInData.MobileNonInteractive[$uid].UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss') }  else { $null }
+        $lastDate    = if ($activityDates.ContainsKey($uid)) { $activityDates[$uid] } else { $null }
+        $deviceFlags = if ($deviceUsage.ContainsKey($uid))   { $deviceUsage[$uid]   } else { $null }
 
         $results.Add([PSCustomObject]@{
-            DisplayName                              = $user.DisplayName
-            Email                                    = if ($user.Mail) { $user.Mail } else { $user.UserPrincipalName }
-            UserPrincipalName                        = $user.UserPrincipalName
-            OfficeLocation                           = $user.OfficeLocation
-            Department                               = $user.Department
-            Title                                    = $user.JobTitle
-            AccountEnabled                           = $user.AccountEnabled
-            TeamsDesktopInteractiveLastLogin_UTC     = $desktopI
-            TeamsDesktopNonInteractiveLastLogin_UTC  = $desktopNI
-            TeamsMobileInteractiveLastLogin_UTC      = $mobileI
-            TeamsMobileNonInteractiveLastLogin_UTC   = $mobileNI
+            DisplayName            = $user.DisplayName
+            Email                  = if ($user.Mail) { $user.Mail } else { $user.UserPrincipalName }
+            UserPrincipalName      = $user.UserPrincipalName
+            OfficeLocation         = $user.OfficeLocation
+            Department             = $user.Department
+            Title                  = $user.JobTitle
+            AccountEnabled         = $user.AccountEnabled
+            TeamsLastActivity_Date = $lastDate
+            TeamsUsedDesktop       = if ($null -ne $deviceFlags) { $deviceFlags.UsedDesktop } else { $null }
+            TeamsUsedMobile        = if ($null -ne $deviceFlags) { $deviceFlags.UsedMobile }  else { $null }
+            TeamsUsedWeb           = if ($null -ne $deviceFlags) { $deviceFlags.UsedWeb }     else { $null }
         })
     }
 
@@ -573,11 +519,10 @@ function Invoke-SharePointUpload {
 
 #region Main
 
-Write-Log "=== Get-TeamsActivityLog v2.5.3 ==="
-Write-Log "Start Time      : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
-Write-Log "Days Back       : $DaysBack (interactive)"
-Write-Log "NI Days Back    : $NonInteractiveDaysBack (non-interactive)"
-Write-Log "Report Dir      : $ReportBaseDir"
+Write-Log "=== Get-TeamsActivityLog v3.0.1 ==="
+Write-Log "Start Time  : $($scriptStartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+Write-Log "Period      : $Period"
+Write-Log "Report Dir  : $ReportBaseDir"
 
 # Validate SharePoint parameters
 if (-not $SkipSharePointUpload -and [string]::IsNullOrWhiteSpace($SharePointSiteUrl)) {
@@ -596,7 +541,7 @@ if ($certPathProvided -and $null -eq $CertificatePassword) {
 }
 
 $useAppOnlyAuth = $clientIdProvided -and ($thumbprintProvided -or $certPathProvided)
-Write-Log "Auth Mode  : $(if ($useAppOnlyAuth) { 'App-Only (Certificate)' } else { 'Interactive (Delegated)' })"
+Write-Log "Auth Mode   : $(if ($useAppOnlyAuth) { 'App-Only (Certificate)' } else { 'Interactive (Delegated)' })"
 
 # Validate required modules
 foreach ($module in $GraphModules) { Assert-RequiredModule -ModuleName $module }
@@ -639,7 +584,7 @@ try {
         }
     }
     else {
-        $connectParams['Scopes'] = @('User.Read.All', 'AuditLog.Read.All')
+        $connectParams['Scopes'] = @('User.Read.All', 'Reports.Read.All')
         Write-Log "Authentication method: interactive (delegated)."
         Connect-MgGraph @connectParams
     }
@@ -662,9 +607,13 @@ try {
         exit 0
     }
 
-    $niDays        = [int]$NonInteractiveDaysBack.TrimStart('D')
-    $signInData    = Get-TeamsSignInData -DaysBack $DaysBack -NonInteractiveDaysBack $niDays
-    $exportedFiles = Export-TeamsReports -Users $activeUsers -SignInData $signInData
+    $activityDates = Get-TeamsActivityReport    -Period $Period
+    $deviceUsage   = Get-TeamsDeviceUsageReport -Period $Period
+
+    $exportedFiles = Export-TeamsReports -Users $activeUsers -ActivityData @{
+        ActivityDates = $activityDates
+        DeviceUsage   = $deviceUsage
+    }
 }
 catch {
     Write-Log "An unexpected error occurred: $_" -Level Error

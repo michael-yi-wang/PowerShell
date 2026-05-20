@@ -1,8 +1,8 @@
 # Get-TeamsActivityLog
 
-A PowerShell 7 script that retrieves the last Microsoft Teams Desktop and Mobile sign-in time for all active users in a Microsoft 365 tenant, grouped by Office Location, with optional upload to SharePoint Online.
+A PowerShell 7 script that retrieves the most recent Microsoft Teams activity date for all active users in a Microsoft 365 tenant, grouped by Office Location, with optional upload to SharePoint Online.
 
-Both **interactive** (credential prompt / MFA) and **non-interactive** (saved credentials / silent token refresh) sign-ins are captured, so users who simply launch Teams without being re-prompted are correctly reflected in the report.
+Data is sourced from the **Microsoft Graph Reports API** (`getTeamsUserActivityUserDetail` and `getTeamsDeviceUsageUserDetail`), which provides pre-aggregated per-user activity data without processing raw sign-in logs. This makes the script significantly faster than sign-in log approaches and supports lookback periods of up to **180 days**.
 
 ---
 
@@ -10,14 +10,10 @@ Both **interactive** (credential prompt / MFA) and **non-interactive** (saved cr
 
 The script connects to Microsoft Graph (app-only or interactive) and:
 
-1. Enumerates all **enabled, non-guest member accounts** from Entra ID.
-2. Queries **both interactive and non-interactive Entra ID sign-in audit logs** for successful Microsoft Teams authentications within their respective lookback windows (default: 30 days each). The most recent timestamp per source is tracked per user per platform.
-   - Interactive sign-ins are controlled by `-DaysBack` (1–30 days).
-   - Non-interactive sign-ins are controlled by `-NonInteractiveDaysBack` (D1, D7, D14, D30). A shorter window is recommended for large tenants as non-interactive events can be 10–50× more numerous.
-3. Classifies each sign-in as **Desktop** or **Mobile** based on the device operating system:
-   - **Mobile**: iOS, Android, Windows Phone
-   - **Desktop**: Windows, macOS, Linux, ChromeOS, and all other non-empty OS values
-4. Exports per-location CSV reports and writes a timestamped execution log.
+1. Enumerates all **enabled, non-guest member accounts** from Entra ID (for display name, office location, department, etc.).
+2. Calls the **Teams User Activity report** (`getTeamsUserActivityUserDetail`) to retrieve the last date each user participated in any Teams activity (chat, calls, meetings, etc.) within the selected period.
+3. Calls the **Teams Device Usage report** (`getTeamsDeviceUsageUserDetail`) to retrieve boolean flags indicating which platform types (Desktop, Mobile, Web) each user used during the period.
+4. Joins both reports to the user list by Entra Object ID, exports per-location CSV reports, and writes a timestamped execution log.
 5. Optionally uploads each CSV to a SharePoint Online document library.
 
 ---
@@ -50,14 +46,14 @@ The script connects to Microsoft Graph (app-only or interactive) and:
 | `Department` | Department from Entra ID profile |
 | `Title` | Job title from Entra ID profile |
 | `AccountEnabled` | Whether the account is enabled in Entra ID |
-| `TeamsDesktopInteractiveLastLogin_UTC` | Latest Teams Desktop/Web **interactive** sign-in (UTC) |
-| `TeamsDesktopNonInteractiveLastLogin_UTC` | Latest Teams Desktop/Web **non-interactive** sign-in (UTC) |
-| `TeamsMobileInteractiveLastLogin_UTC` | Latest Teams Mobile **interactive** sign-in (UTC) |
-| `TeamsMobileNonInteractiveLastLogin_UTC` | Latest Teams Mobile **non-interactive** sign-in (UTC) |
+| `TeamsLastActivity_Date` | Most recent date the user had any Teams activity (`YYYY-MM-DD`), across all time — not limited to the selected period. Empty if the user has never had any Teams activity. |
+| `TeamsUsedDesktop` | `True` if the user used Teams on Windows, macOS, Linux, or ChromeOS **within the selected period** |
+| `TeamsUsedMobile` | `True` if the user used Teams on iOS or Android **within the selected period** |
+| `TeamsUsedWeb` | `True` if the user used the Teams web client **within the selected period** |
 
-> **Timezone note:** All timestamps are in **UTC**. Browser-based (web client) sign-ins have no OS reported and are classified as Desktop.
+> **Note:** `TeamsLastActivity_Date` is a **date** (not a timestamp) and reflects the user's **all-time** last activity — a user last active 6 months ago will still show that date even with `-Period D30`. The device-type columns (`TeamsUsedDesktop`, `TeamsUsedMobile`, `TeamsUsedWeb`) are scoped to the selected period and will be `False` if the user did not use that platform type within the period, even if they were active overall.
 
-Empty cells mean the user had **no activity** of that type on that platform in the lookback period.
+Empty `TeamsLastActivity_Date` means the user has **never had any Teams activity** (or has never been licensed for Teams).
 
 ---
 
@@ -74,7 +70,7 @@ $PSVersionTable.PSVersion
 ### 2. Required Modules
 
 ```powershell
-# Microsoft Graph (covers all three required sub-modules)
+# Microsoft Graph (covers all required sub-modules)
 Install-Module -Name Microsoft.Graph -Scope CurrentUser -Repository PSGallery
 
 # PnP.PowerShell (only required when uploading to SharePoint)
@@ -94,7 +90,7 @@ Install-Module -Name PnP.PowerShell -Scope CurrentUser -Repository PSGallery
 | Permission | Purpose |
 |---|---|
 | `User.Read.All` | Read all user profiles |
-| `AuditLog.Read.All` | Read sign-in audit logs |
+| `Reports.Read.All` | Read Microsoft 365 usage reports (Teams activity and device usage) |
 
 > Both permissions require **admin consent**. Grant it in:  
 > **Azure Portal → Entra ID → App registrations → \<your app\> → API permissions → Grant admin consent**
@@ -169,8 +165,7 @@ openssl pkcs12 -export \
 | `-CertificateThumbprint` | One of two | — | Certificate thumbprint from the local store |
 | `-CertificatePath` | One of two | — | Path to a `.pfx` certificate file |
 | `-CertificatePassword` | When using `-CertificatePath` | — | SecureString password for the `.pfx` |
-| `-DaysBack` | No | `30` | Interactive sign-in lookback window (1–30 days) |
-| `-NonInteractiveDaysBack` | No | `D30` | Non-interactive sign-in lookback window (`D1`, `D7`, `D14`, `D30`). Use a shorter value to reduce run time on large tenants. |
+| `-Period` | No | `D30` | Reporting period: `D7`, `D30`, `D90`, or `D180` |
 | `-SharePointSiteUrl` | Unless `-SkipSharePointUpload` | — | Full SharePoint site URL |
 | `-SharePointDocumentLibrary` | No | `Documents` | Document library URL name |
 | `-SharePointBaseFolderPath` | No | `Teams Activity` | Base folder within the library |
@@ -185,18 +180,19 @@ openssl pkcs12 -export \
     -SkipSharePointUpload
 ```
 
-**Windows — certificate thumbprint with SharePoint upload:**
+**Windows — certificate thumbprint with SharePoint upload, 90-day period:**
 ```powershell
 .\Get-TeamsActivityLog.ps1 `
     -TenantId              'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
     -ClientId              'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
     -CertificateThumbprint 'ABCDEF1234567890ABCDEF1234567890ABCDEF12' `
+    -Period                D90 `
     -SharePointSiteUrl     'https://contoso.sharepoint.com/sites/IT' `
     -SharePointDocumentLibrary 'Documents' `
     -SharePointBaseFolderPath  'Teams Activity'
 ```
 
-**macOS — PFX file with SharePoint upload, 14-day lookback:**
+**macOS — PFX file with SharePoint upload, 7-day period:**
 ```powershell
 $pwd = Read-Host -AsSecureString 'Certificate password'
 .\Get-TeamsActivityLog.ps1 `
@@ -204,19 +200,8 @@ $pwd = Read-Host -AsSecureString 'Certificate password'
     -ClientId            'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
     -CertificatePath     '/Users/admin/certs/TeamsActivityLog.pfx' `
     -CertificatePassword $pwd `
-    -SharePointSiteUrl   'https://contoso.sharepoint.com/sites/IT' `
-    -DaysBack            14
-```
-
-**Large tenant — shorter non-interactive window to reduce run time:**
-```powershell
-.\Get-TeamsActivityLog.ps1 `
-    -TenantId              'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
-    -ClientId              'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
-    -CertificateThumbprint 'ABCDEF1234567890ABCDEF1234567890ABCDEF12' `
-    -DaysBack              30 `
-    -NonInteractiveDaysBack D7 `
-    -SkipSharePointUpload
+    -Period              D7 `
+    -SharePointSiteUrl   'https://contoso.sharepoint.com/sites/IT'
 ```
 
 **Task Scheduler (unattended):**
@@ -236,36 +221,52 @@ When `-SkipSharePointUpload` is not specified, each location CSV is uploaded to:
 {DocumentLibrary}/{BaseFolderPath}/{OfficeLocation}/YYYY/MM/{OfficeLocation}-TeamsActivity-YYYYMMDD.csv
 ```
 
-**Example** (default settings, location `FSHO`, run on 2026-05-16):
+**Example** (default settings, location `FSHO`, run on 2026-05-19):
 ```
-Documents/Teams Activity/FSHO/2026/05/FSHO-TeamsActivity-20260516.csv
+Documents/Teams Activity/FSHO/2026/05/FSHO-TeamsActivity-20260519.csv
 ```
 
 ---
 
-## Notes and Warnings
+## Notes
 
-### Sign-in Log Retention Limit
+### Report Data Freshness
 
-> **Warning:** Entra ID sign-in logs are retained for **30 days** on Microsoft Entra ID Free and Microsoft 365 Apps tiers. The maximum value for `-DaysBack` is therefore **30**.
->
-> For longer retention, your tenant requires **Microsoft Entra ID P1 or P2** (included in Microsoft 365 E3/E5), or logs must be exported to **Azure Monitor / Microsoft Sentinel**.
+The Microsoft Graph Reports API aggregates data with a typical delay of **24–48 hours**. The `TeamsLastActivity_Date` column reflects the last confirmed activity date at the time the report was generated by Microsoft, not necessarily yesterday.
 
-### Performance on Large Tenants
+### Usage Report Anonymization
 
-The script reads all Microsoft Teams sign-in records for the tenant across the respective lookback windows. Non-interactive sign-in events (silent token refreshes) are generated continuously in the background and can be 10–50× more numerous than interactive sign-ins. For large tenants (10,000+ users), the non-interactive query can produce several million records and take several hours with the default 30-day window.
+If your tenant has Microsoft 365 usage report anonymization enabled (**M365 Admin Center → Settings → Org Settings → Reports → Privacy**), the Reports API returns obfuscated user identifiers. The script detects this and logs a warning — in this state, activity dates cannot be joined to individual users and the `TeamsLastActivity_Date` and device columns will be empty for all users.
 
-**Recommended mitigation:** use `-NonInteractiveDaysBack D7` to limit the non-interactive query to 7 days. This typically reduces non-interactive record volume by ~75% while still providing a meaningful "last active" timestamp.
+To resolve: disable anonymization in the M365 Admin Center, or assign the **Reports Reader** role to the service account so it can see de-anonymized data.
 
-A progress counter is displayed during processing.
+### What Counts as Teams Activity
 
-### Teams Web Client
+`TeamsLastActivity_Date` only reflects dates when the user **actively participated** in Teams — not passive use such as opening the app or reading messages.
 
-Browser-based Teams access (`teams.microsoft.com`) is classified as **Desktop** because the underlying device OS (Windows, macOS) is reported — not the browser. This is expected behaviour.
+**Actions that count:**
+
+| Action | Notes |
+|---|---|
+| Sent a channel or team message | Includes original posts and replies |
+| Sent a private or group chat message | |
+| Made or received a 1:1 call | |
+| Attended or organised a meeting | Scheduled, ad-hoc, or recurring |
+| Used audio, video, or screen share | |
+| Any other interaction | Reactions, edits, and similar actions via `Has Other Action` |
+
+**Actions that do NOT count:**
+
+- Opening the Teams app
+- Reading messages without responding
+- Being present or showing as available (online status)
+- Receiving calls or notifications without answering
+
+> **Note:** This differs from the v2.x sign-in log approach, which captured every Teams authentication event — including simply launching the app. A user who opens Teams daily to read messages but never sends anything will have no `TeamsLastActivity_Date`, whereas the old script would have shown them as active. This makes the Reports API approach more accurate for identifying genuinely inactive users.
 
 ### Users with No Teams Activity
 
-Users who did not sign into Teams during the lookback period still appear in the report with empty `TeamsDesktopLastLogin` / `TeamsMobileLastLogin` fields, allowing you to identify inactive users alongside active ones.
+Users who had no Teams activity during the selected period still appear in the report with empty activity and device columns, making it easy to identify inactive users alongside active ones.
 
 ### Office Location Grouping
 
@@ -281,9 +282,22 @@ Rotate your certificate before it expires. Upload the new public key to the Entr
 
 | Symptom | Likely Cause | Resolution |
 |---|---|---|
-| `Insufficient privileges` | Admin consent not granted | Grant admin consent for `User.Read.All` and `AuditLog.Read.All` |
+| `Insufficient privileges` | Admin consent not granted | Grant admin consent for `User.Read.All` and `Reports.Read.All` |
 | `AADSTS700027` — certificate not trusted | Certificate not uploaded to Entra app | Upload the `.cer` / `.crt` public key to **Certificates & secrets** |
 | `CryptographicException` on macOS | Wrong password or corrupted `.pfx` | Re-export the `.pfx` and verify the password |
 | SharePoint upload fails with 403 | App not granted site-level access | Run `Grant-PnPAzureADAppSitePermission` for this app and site |
-| Empty report (0 records) | No Teams sign-ins in the period | Increase `-DaysBack` / `-NonInteractiveDaysBack` or verify Teams is actively used |
-| Sign-in logs return 0 results | `AuditLog.Read.All` missing or no consent | Check API permissions and re-grant admin consent |
+| All `TeamsLastActivity_Date` cells empty | Report anonymization enabled | Disable anonymization in M365 Admin Center or assign Reports Reader role |
+| Empty report (0 records) | No active users or no Teams licences | Verify users are active members and Teams is deployed in the tenant |
+| Reports API returns no data | `Reports.Read.All` missing or no consent | Check API permissions and re-grant admin consent |
+
+---
+
+## Version History
+
+| Version | Date | Notes |
+|---|---|---|
+| 3.0.1 | 2026-05-19 | Fixed device usage flags always showing False: API returns `Yes`/`No` values, not `True`/`False` as documented. Fixed strict-mode crash on absent CSV columns (e.g. `Used Chrome OS` omitted by some tenants). Fixed column name normalisation for API double-space typo in `Used  Chrome OS`. |
+| 3.0.0 | 2026-05-19 | Switched data source from Entra ID sign-in audit logs to Graph Reports API. Replaced `-DaysBack` / `-NonInteractiveDaysBack` / `-NonInteractiveParallelism` with `-Period`. Replaced `TeamsDesktopLastLogin_UTC` / `TeamsMobileLastLogin_UTC` / `TeamsLastLogin_UTC` columns with `TeamsLastActivity_Date`, `TeamsUsedDesktop`, `TeamsUsedMobile`, `TeamsUsedWeb`. Permission changed from `AuditLog.Read.All` to `Reports.Read.All`. Lookback extended to 180 days. |
+| 2.9.0 | 2026-05-18 | Restored Desktop/Mobile columns alongside combined `TeamsLastLogin_UTC`. |
+| 2.8.0 | 2026-05-17 | Simplified output to single `TeamsLastLogin_UTC`; reduced default parallelism. |
+| 2.7.0 | 2026-05-16 | Parallel NI time-window chunks; simplified output to Desktop/Mobile only. |
