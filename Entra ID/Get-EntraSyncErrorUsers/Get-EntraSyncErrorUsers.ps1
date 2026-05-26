@@ -81,10 +81,14 @@
 
 .NOTES
     Author:  Michael Wang
-    Version: 1.1
-    Date:    2026-05-18
+    Version: 1.2
+    Date:    2026-05-25
 
     Change log:
+      1.2 - Set $env:SharePointPnPHttpTimeout = 600 to override PnP.PowerShell's
+            hardcoded 100-second HttpClient limit (no -RequestTimeout parameter exists).
+            Hardened retry timeout detection to check exception type in addition
+            to string matching.
       1.1 - Added 3-attempt retry loop around Add-PnPFile to handle intermittent
             SharePoint upload timeouts (HttpClient.Timeout 100 s default).
 
@@ -475,6 +479,12 @@ if (-not $SkipSharePointUpload) {
     Write-Log -Message "Connecting to SharePoint Online: $SharePointSiteUrl"
 
     try {
+        # Override PnP.PowerShell's default 100-second HttpClient timeout.
+        # SharePointPnPHttpTimeout (seconds) is read at connection time; -1 = infinite.
+        # Ref: https://github.com/pnp/powershell/issues/4899
+        $env:SharePointPnPHttpTimeout = 600  # 10 minutes
+        Write-Log -Message "SharePoint HTTP timeout set to 600 s via SharePointPnPHttpTimeout."
+
         $pnpConnectParams = @{
             Url = $SharePointSiteUrl
         }
@@ -539,7 +549,9 @@ if (-not $SkipSharePointUpload) {
                 break
             }
             catch {
-                $isTimeout = $_.ToString() -match 'timeout|canceled|HttpClient|TaskCanceled'
+                $isTimeout = ($_.Exception -is [System.Threading.Tasks.TaskCanceledException]) -or
+                             ($_.Exception?.InnerException -is [System.TimeoutException]) -or
+                             ($_.ToString() -match 'timeout|canceled|HttpClient|TaskCanceled')
                 if ($isTimeout -and $attempt -lt $maxAttempts) {
                     Write-Log -Message "Upload timed out (attempt $attempt). Waiting 30s before retry..." -Level Warning
                     Start-Sleep -Seconds 30
