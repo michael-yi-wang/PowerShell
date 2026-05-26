@@ -56,8 +56,12 @@
 
 .NOTES
     Author   : Michael Wang
-    Version  : 1.9.0
+    Version  : 1.10.0
     Requires : PowerShell 7.0+, PnP.PowerShell module
+
+    At startup the script verifies that PowerShell 7.0 or later is running and
+    that PnP.PowerShell is installed. If the module is absent the script offers
+    to install it automatically (CurrentUser scope) before continuing.
 
     The Entra ID app registration must hold the SharePoint application permission:
         Sites.FullControl.All  (admin consent required)
@@ -128,15 +132,49 @@ function Write-Log {
 
 #region Module Check
 
+function Assert-PowerShellVersion {
+    $required = [Version]'7.0'
+    $current  = $PSVersionTable.PSVersion
+
+    if ($current -lt $required) {
+        Write-Host ''
+        Write-Host "  [ERROR] This script requires PowerShell $required or later." -ForegroundColor Red
+        Write-Host "          Detected version: $current" -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host '  Download PowerShell 7 from: https://aka.ms/powershell' -ForegroundColor Cyan
+        Write-Host ''
+        exit 1
+    }
+
+    Write-Log -Message "PowerShell version: $current (OK)"
+}
+
 function Assert-PnPModule {
     if (-not (Get-Module -ListAvailable -Name 'PnP.PowerShell')) {
         Write-Host ''
-        Write-Host '  [ERROR] PnP.PowerShell module is not installed.' -ForegroundColor Red
-        Write-Host '  Run the following command, then re-run this script:' -ForegroundColor Yellow
+        Write-Host '  [WARNING] PnP.PowerShell module is not installed.' -ForegroundColor Yellow
         Write-Host ''
-        Write-Host '    Install-Module -Name PnP.PowerShell -Scope CurrentUser' -ForegroundColor Cyan
-        Write-Host ''
-        exit 1
+
+        $install = (Read-Host '  Install PnP.PowerShell now for the current user? (Y/N)').Trim().ToUpper()
+
+        if ($install -ne 'Y') {
+            Write-Host ''
+            Write-Host '  Installation declined. Script cannot continue.' -ForegroundColor Red
+            Write-Host '  To install manually, run:' -ForegroundColor Yellow
+            Write-Host '    Install-Module -Name PnP.PowerShell -Scope CurrentUser' -ForegroundColor Cyan
+            Write-Host ''
+            exit 1
+        }
+
+        try {
+            Write-Log -Message 'Installing PnP.PowerShell module (CurrentUser scope)...'
+            Install-Module -Name 'PnP.PowerShell' -Scope CurrentUser -ErrorAction Stop
+            Write-Log -Message 'PnP.PowerShell installed successfully.'
+        }
+        catch {
+            Write-Log -Message "Module installation failed: $($_.Exception.Message)" -Level Error
+            exit 1
+        }
     }
     Import-Module -Name 'PnP.PowerShell' -ErrorAction Stop
     Write-Log -Message 'PnP.PowerShell module loaded.'
@@ -1042,6 +1080,7 @@ function Start-InteractiveMenu {
 
 #region Entry Point
 
+Assert-PowerShellVersion
 Assert-PnPModule
 
 Write-Log -Message "Script started. Log file: $script:LogFile"

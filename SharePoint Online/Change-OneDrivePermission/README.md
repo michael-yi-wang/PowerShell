@@ -13,22 +13,57 @@ admins are never removed when adding a new one.
 
 | Requirement | Details |
 |---|---|
-| PowerShell | 7.0 or later |
-| PnP.PowerShell | Latest version (see [Installation](#1-install-pnppowershell)) |
+| PowerShell | 7.0 or later ([Download](https://aka.ms/powershell)) |
+| PnP.PowerShell | Latest version — installed automatically if absent (see [Setup](#1-pnppowershell-module)) |
 | Entra ID App Registration | Already created with a certificate credential uploaded |
 | Certificate | Already issued; private key installed on the machine running the script |
 
 ---
 
+## Startup Checks
+
+Every time the script runs, it performs two checks before doing anything else:
+
+**1. PowerShell version**
+
+```
+[ERROR] This script requires PowerShell 7.0 or later.
+        Detected version: 5.1.19041.5486
+
+  Download PowerShell 7 from: https://aka.ms/powershell
+```
+
+If the running PowerShell is older than 7.0 the script exits immediately with
+an error and a download link.
+
+**2. PnP.PowerShell module**
+
+If the module is not installed, the script offers to install it rather than
+exiting silently:
+
+```
+  [WARNING] PnP.PowerShell module is not installed.
+
+  Install PnP.PowerShell now for the current user? (Y/N):
+```
+
+- **Y** — runs `Install-Module -Name PnP.PowerShell -Scope CurrentUser` and
+  continues.
+- **N** — exits and prints the manual install command.
+
+---
+
 ## Setup
 
-### 1. Install PnP.PowerShell
+### 1. PnP.PowerShell Module
+
+The script installs PnP.PowerShell automatically when it is missing (see
+[Startup Checks](#startup-checks) above). To install it manually before the
+first run:
 
 ```powershell
 Install-Module -Name PnP.PowerShell -Scope CurrentUser
 ```
-
-The script will detect a missing module and remind you to install it before exiting.
 
 ---
 
