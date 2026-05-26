@@ -1,15 +1,16 @@
 # Invoke-PimGroupActivation
 
-An interactive PowerShell script to manage and activate **Microsoft Entra ID Privileged Identity Management (PIM) for Groups** assignments.
+An interactive PowerShell script to manage, activate, and deactivate **Microsoft Entra ID Privileged Identity Management (PIM) for Groups** assignments.
 
 ## Overview
 
-`Invoke-PimGroupActivation.ps1` simplifies the process of activating eligible group assignments. It provides an interactive menu that allows users to view their current eligibility status, identify which groups require approval, and perform single or bulk activations directly from the console.
+`Invoke-PimGroupActivation.ps1` simplifies the process of activating and deactivating eligible group assignments. It provides an interactive menu that allows users to view their current eligibility status, identify which groups require approval, and perform single or bulk activations or deactivations directly from the console.
 
 ## Features
 
-- **Interactive Menu:** Select a specific group by index, activate all eligible groups at once, or refresh the list.
+- **Interactive Menu:** Select a specific group by index, activate all eligible groups at once, deactivate active groups, or refresh the list.
 - **Bulk Activation with Confirmation:** Activating all eligible groups requires an explicit confirmation prompt to prevent accidental bulk requests.
+- **Group Deactivation:** Deactivate any currently active PIM group assignment — individually or all at once — with a confirmation prompt for bulk operations.
 - **Approval Detection:** Automatically identifies groups that require approval for activation and separates them into a dedicated non-selectable section with guidance.
 - **Optional Approval Workflow:** By default, groups requiring approval are filtered out; they can be included using `-IncludeApproveRequestGroup`.
 - **Automatic Duration Enforcement:** Checks the PIM policy for each group and caps the requested duration to the maximum allowed by the organization.
@@ -22,12 +23,32 @@ An interactive PowerShell script to manage and activate **Microsoft Entra ID Pri
 
 ## Interactive Menu Behavior
 
-The script displays eligible groups in two sections:
+The script displays eligible groups in two sections and offers the following menu options:
+
+| Option | Description |
+| :--- | :--- |
+| `[1-N]` | Activate a specific eligible group by its index number. |
+| `[A]` | Activate **all** eligible groups at once (requires confirmation). |
+| `[D]` | Open the deactivation sub-menu (shown only when active groups exist). |
+| `[R]` | Refresh the group list from the API. |
+| `[Q]` | Quit the script. |
+
+### Activation Sections
 
 1. **Selectable Groups:** Groups you can activate through the script.
    - By default, only includes groups that **do not** require approval.
    - With `-IncludeApproveRequestGroup`, approval-gated groups are added to this list. Their requests will remain pending until an approver acts.
 2. **Approval Required (View Only):** Groups requiring approval are shown separately when the parameter is not specified, along with a tip on how to include them.
+
+### Deactivation Sub-Menu (`[D]`)
+
+When one or more groups are already active, the `[D]` option becomes available. Selecting it opens a dedicated sub-menu listing all currently active groups with their own sequential index.
+
+| Option | Description |
+| :--- | :--- |
+| `[1-N]` | Deactivate a specific active group. |
+| `[A]` | Deactivate **all** active groups at once (requires confirmation). |
+| `[B]` | Return to the main menu without changes. |
 
 ## Prerequisites
 
@@ -94,7 +115,7 @@ For every group, the script queries the PIM assignment policy to retrieve the ma
 | File | Naming Pattern | Description |
 | :--- | :--- | :--- |
 | Log | `Invoke-PimGroupActivation_YYYYMMDD_HHMMSS.log` | Full execution log with timestamps and log levels |
-| Results | `Invoke-PimGroupActivation_Results_YYYYMMDD_HHMMSS.csv` | Activation results (group, access type, status, error) |
+| Results | `Invoke-PimGroupActivation_Results_YYYYMMDD_HHMMSS.csv` | Session results (action, group, access type, status, error) |
 
 Both files are saved in the same directory as the script.
 

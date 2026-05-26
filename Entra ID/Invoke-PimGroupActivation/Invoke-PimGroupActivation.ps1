@@ -3,12 +3,12 @@
 
 <#
 .SYNOPSIS
-    Connects to Entra ID and allows interactive activation of eligible PIM for Groups assignments.
+    Connects to Entra ID and allows interactive activation and deactivation of eligible PIM for Groups assignments.
 
 .DESCRIPTION
     This script performs an interactive login to Entra ID using the Microsoft Graph PowerShell SDK.
     It identifies eligible PIM group assignments, checks which are already active, and provides
-    an interactive menu for the user to activate specific groups or all at once.
+    an interactive menu for the user to activate or deactivate specific groups or all at once.
 
 .PARAMETER Justification
     The reason for the PIM activation.
@@ -28,8 +28,8 @@
 
 .NOTES
     Author: Michael Wang
-    Version: 1.1
-    Date: 2026-04-24
+    Version: 1.2
+    Date: 2026-05-25
 #>
 
 [CmdletBinding()]
@@ -257,9 +257,15 @@ try {
             Write-Host ""
         }
 
+        # Build list of currently active groups for the deactivation sub-menu
+        $ActiveList = @($DisplayList | Where-Object { $_.Status -eq "Already Active" })
+
         Write-Host "Options:"
         Write-Host " [1-$($DisplayList.Count)] Activate specific group"
         Write-Host " [A] Activate ALL eligible groups"
+        if ($ActiveList.Count -gt 0) {
+            Write-Host " [D] Deactivate active group(s)"
+        }
         Write-Host " [R] Refresh list"
         Write-Host " [Q] Quit"
         Write-Host ""
@@ -298,6 +304,111 @@ try {
                 continue
             }
             $ToActivate = @($Selected)
+        }
+        elseif ($Choice -eq 'D') {
+            if ($ActiveList.Count -eq 0) {
+                Write-Log -Level Info -Message "No active groups to deactivate."
+                Start-Sleep -Seconds 2
+                continue
+            }
+
+            Clear-Host
+            Write-Host "--- Deactivate Active PIM Groups ---" -ForegroundColor Cyan
+            Write-Host ""
+
+            # Build a clean indexed list for the deactivation sub-menu
+            $DeactivateMenuList = [System.Collections.Generic.List[PSObject]]::new()
+            $DeactIdx = 0
+            foreach ($ActiveItem in $ActiveList) {
+                $DeactIdx++
+                $DeactivateMenuList.Add([PSCustomObject]@{
+                    DeactivateIndex = $DeactIdx
+                    GroupName       = $ActiveItem.GroupName
+                    Access          = $ActiveItem.Access
+                    GroupId         = $ActiveItem.GroupId
+                    AccessId        = $ActiveItem.AccessId
+                })
+            }
+
+            $DeactivateMenuList | Format-Table DeactivateIndex, GroupName, Access -AutoSize
+
+            Write-Host "Options:"
+            Write-Host " [1-$($DeactivateMenuList.Count)] Deactivate specific group"
+            Write-Host " [A] Deactivate ALL active groups"
+            Write-Host " [B] Back to main menu"
+            Write-Host ""
+            $DeactChoice = Read-Host "Select an option"
+
+            $ToDeactivate = $null
+            if ($DeactChoice -eq 'B') {
+                continue
+            }
+            elseif ($DeactChoice -eq 'A') {
+                $ToDeactivate = $DeactivateMenuList
+                Write-Host ""
+                $Confirm = Read-Host "About to deactivate $($ToDeactivate.Count) group(s). Confirm? (Y/N)"
+                if ($Confirm -notmatch '^[Yy]$') {
+                    Write-Log -Level Info -Message "Bulk deactivation cancelled by user."
+                    Start-Sleep -Seconds 2
+                    continue
+                }
+                Write-Log -Level Info -Message "Deactivating all active groups..."
+            }
+            elseif ($DeactChoice -match '^\d+$' -and [int]$DeactChoice -ge 1 -and [int]$DeactChoice -le $DeactivateMenuList.Count) {
+                $ToDeactivate = @($DeactivateMenuList[[int]$DeactChoice - 1])
+            }
+            else {
+                Write-Host "Invalid selection. Try again." -ForegroundColor Red
+                Start-Sleep -Seconds 2
+                continue
+            }
+
+            foreach ($Item in $ToDeactivate) {
+                Write-Log -Level Info -Message "Deactivating '$($Item.GroupName)' ($($Item.Access))..."
+
+                $DeactParams = @{
+                    AccessId      = $Item.AccessId
+                    PrincipalId   = $PrincipalId
+                    GroupId       = $Item.GroupId
+                    Action        = "selfDeactivate"
+                    Justification = $Justification
+                }
+
+                try {
+                    $Request = New-MgIdentityGovernancePrivilegedAccessGroupAssignmentScheduleRequest -BodyParameter $DeactParams -ErrorAction Stop
+                    Write-Log -Level Info -Message "Deactivation request submitted for '$($Item.GroupName)'. Status: $($Request.Status)"
+                    $Results.Add([PSCustomObject]@{
+                        Timestamp  = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                        Action     = "Deactivate"
+                        GroupName  = $Item.GroupName
+                        GroupId    = $Item.GroupId
+                        AccessType = $Item.AccessId
+                        Status     = $Request.Status
+                        Error      = ""
+                    })
+                }
+                catch {
+                    $ErrMsg = if ($_.Exception.Message -match 'ActiveDurationTooShort') {
+                        "Cannot deactivate '$($Item.GroupName)' yet — Entra requires a minimum active period of 5 minutes before self-deactivation."
+                    } else {
+                        "Failed to deactivate '$($Item.GroupName)': $($_.Exception.Message)"
+                    }
+                    Write-Log -Level Error -Message $ErrMsg
+                    $Results.Add([PSCustomObject]@{
+                        Timestamp  = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                        Action     = "Deactivate"
+                        GroupName  = $Item.GroupName
+                        GroupId    = $Item.GroupId
+                        AccessType = $Item.AccessId
+                        Status     = "Failed"
+                        Error      = $_.Exception.Message
+                    })
+                }
+            }
+
+            Write-Host "Done. Press any key to return to menu..."
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            continue
         }
         else {
             Write-Host "Invalid selection. Try again." -ForegroundColor Red
@@ -340,10 +451,11 @@ try {
             }
 
             try {
-                $Request = New-MgIdentityGovernancePrivilegedAccessGroupAssignmentScheduleRequest -BodyParameter $Params
+                $Request = New-MgIdentityGovernancePrivilegedAccessGroupAssignmentScheduleRequest -BodyParameter $Params -ErrorAction Stop
                 Write-Log -Level Info -Message "Activation request submitted for '$($Item.GroupName)'. Status: $($Request.Status)"
                 $Results.Add([PSCustomObject]@{
                     Timestamp  = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                    Action     = "Activate"
                     GroupName  = $Item.GroupName
                     GroupId    = $Item.GroupId
                     AccessType = $Item.AccessId
@@ -355,6 +467,7 @@ try {
                 Write-Log -Level Error -Message "Failed to activate '$($Item.GroupName)': $($_.Exception.Message)"
                 $Results.Add([PSCustomObject]@{
                     Timestamp  = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                    Action     = "Activate"
                     GroupName  = $Item.GroupName
                     GroupId    = $Item.GroupId
                     AccessType = $Item.AccessId
