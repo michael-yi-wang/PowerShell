@@ -1,4 +1,4 @@
-# Change-DNSNameServer
+# Update-DNSNameServer
 
 ## Overview
 
@@ -39,17 +39,17 @@ already present (Add) or already absent (Remove) are skipped and logged.
 
 Add a newly promoted DC as a name server on every forward lookup zone:
 ```powershell
-.\Change-DNSNameServer.ps1 -AddNameServer -NameServerHostName dc03.contoso.com -NameServerIPAddress 10.0.0.13
+.\Update-DNSNameServer.ps1 -AddNameServer -NameServerHostName dc03.contoso.com -NameServerIPAddress 10.0.0.13
 ```
 
 Remove a demoted DC as a name server from a specific zone only, without prompting:
 ```powershell
-.\Change-DNSNameServer.ps1 -RemoveNameServer -NameServerHostName dc01.contoso.com -ZoneName contoso.com -Force
+.\Update-DNSNameServer.ps1 -RemoveNameServer -NameServerHostName dc01.contoso.com -ZoneName contoso.com -Force
 ```
 
 Preview changes across all zones without applying them:
 ```powershell
-.\Change-DNSNameServer.ps1 -AddNameServer -NameServerHostName dc03.contoso.com -WhatIf
+.\Update-DNSNameServer.ps1 -AddNameServer -NameServerHostName dc03.contoso.com -WhatIf
 ```
 
 ## How It Works
@@ -66,8 +66,8 @@ Preview changes across all zones without applying them:
 
 Both are saved in the script's folder, timestamped:
 
-- **Change-DNSNameServer_\<timestamp\>.log** - full run log (Info/Warning/Error)
-- **Change-DNSNameServer_Results_\<timestamp\>.csv** - per-zone results
+- **Update-DNSNameServer_\<timestamp\>.log** - full run log (Info/Warning/Error)
+- **Update-DNSNameServer_Results_\<timestamp\>.csv** - per-zone results
 
 ### CSV columns
 

@@ -67,13 +67,13 @@
     displayed. Use for unattended runs.
 
 .EXAMPLE
-    .\Change-DNSNameServer.ps1 -AddNameServer -NameServerHostName dc03.contoso.com -NameServerIPAddress 10.0.0.13
+    .\Update-DNSNameServer.ps1 -AddNameServer -NameServerHostName dc03.contoso.com -NameServerIPAddress 10.0.0.13
 
     Adds dc03.contoso.com as a name server on every forward lookup zone that
     does not already have it, after confirmation.
 
 .EXAMPLE
-    .\Change-DNSNameServer.ps1 -RemoveNameServer -NameServerHostName dc01.contoso.com -ZoneName contoso.com -Force
+    .\Update-DNSNameServer.ps1 -RemoveNameServer -NameServerHostName dc01.contoso.com -ZoneName contoso.com -Force
 
     Removes dc01.contoso.com as a name server from the contoso.com zone only,
     without prompting for confirmation.
@@ -122,8 +122,8 @@ param(
 # ----------------------------------------------------------------------------
 $ScriptFolder = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Timestamp    = Get-Date -Format 'yyyyMMdd_HHmmss'
-$LogFile      = Join-Path $ScriptFolder "Change-DNSNameServer_$Timestamp.log"
-$CsvOutput    = Join-Path $ScriptFolder "Change-DNSNameServer_Results_$Timestamp.csv"
+$LogFile      = Join-Path $ScriptFolder "Update-DNSNameServer_$Timestamp.log"
+$CsvOutput    = Join-Path $ScriptFolder "Update-DNSNameServer_Results_$Timestamp.csv"
 
 function Write-Log {
     [CmdletBinding()]
