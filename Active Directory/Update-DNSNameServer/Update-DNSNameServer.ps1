@@ -15,6 +15,12 @@
     name server is already present/absent so it only changes zones that
     actually need it.
 
+    On -AddNameServer runs, every candidate zone is also checked (read-only)
+    for whether the new DC's A (host) record has appeared and matches the
+    supplied -NameServerIPAddress. This runs even for zones where the NS
+    record was already present, so you can confirm a DC's DNS registration
+    has caught up after promotion without re-running the whole script.
+
     The script must be run on a domain controller. It uses the DnsServer
     PowerShell module, which is only available on Windows with the DNS
     Server tools (RSAT-DNS-Server) installed.
@@ -37,11 +43,11 @@
     a name server, e.g. dc03.contoso.com
 
 .PARAMETER NameServerIPAddress
-    Optional. Only used with -AddNameServer. The IPv4/IPv6 address of the new
-    domain controller. Used purely to verify and log whether a matching A
-    (host) record already exists in each zone - the script never creates or
-    modifies A records, since domain controllers self-register those via
-    dynamic DNS update.
+    Required with -AddNameServer. The IPv4 address of the new domain
+    controller. Used to check every candidate zone for a matching A (host)
+    record and report a per-zone IPVerificationStatus of Matched, Mismatch,
+    or NotFound - the script never creates or modifies A records itself,
+    since domain controllers self-register those via dynamic DNS update.
 
 .PARAMETER ZoneName
     Optional. One or more forward lookup zone names to restrict the operation
@@ -80,7 +86,7 @@
 
 .NOTES
     Author  : Michael Wang
-    Version : 1.1
+    Version : 1.2
     Date    : 2026-07-23
     Module  : DnsServer (Windows RSAT DNS Server Tools) - Windows-only, no
               cross-platform equivalent exists for managing Windows DNS Server
@@ -102,7 +108,7 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$NameServerHostName,
 
-    [Parameter(ParameterSetName = 'Add')]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Add')]
     [ValidateNotNullOrEmpty()]
     [string]$NameServerIPAddress,
 
