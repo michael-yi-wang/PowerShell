@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 5.1
 #Requires -Modules DnsServer
 
 <#
@@ -80,13 +80,14 @@
 
 .NOTES
     Author  : Michael Wang
-    Version : 1.0
-    Date    : 2026-07-22
+    Version : 1.1
+    Date    : 2026-07-23
     Module  : DnsServer (Windows RSAT DNS Server Tools) - Windows-only, no
               cross-platform equivalent exists for managing Windows DNS Server
               zone data.
     Requires: Must be run on a domain controller with the DnsServer module
               available, and appropriate DNS administrative privileges.
+              Compatible with both Windows PowerShell 5.1 and PowerShell 7+.
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Add')]

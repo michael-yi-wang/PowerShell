@@ -15,7 +15,7 @@ already present (Add) or already absent (Remove) are skipped and logged.
 
 - Must be run **on a domain controller** - the script verifies this via
   `Win32_ComputerSystem.DomainRole` and stops if it isn't.
-- PowerShell 7.0 or later
+- Windows PowerShell 5.1 or PowerShell 7.0 or later
 - `DnsServer` PowerShell module (Windows DNS Server RSAT tools). This module
   is Windows-only; there is no cross-platform equivalent for managing Windows
   DNS Server zone data.
@@ -90,5 +90,5 @@ Both are saved in the script's folder, timestamped:
 - `-NameServerIPAddress` is informational only for the Add action (used to
   log whether an existing A record matches); it has no effect on Remove.
 - Because it depends on the Windows-only `DnsServer` module, this script
-  cannot run on macOS/Linux PowerShell hosts even though it targets
-  PowerShell 7 syntax.
+  cannot run on macOS/Linux PowerShell hosts, even under PowerShell 7. It
+  runs on Windows under either Windows PowerShell 5.1 or PowerShell 7+.
