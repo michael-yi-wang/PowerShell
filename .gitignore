@@ -14,6 +14,8 @@
 .vscode/
 # log files
 *.log
+# log folders at any level
+logs/
 # gemini files
 GEMINI.md
 .gemini
@@ -21,3 +23,5 @@ GEMINI.md
 # Claude files
 CLAUDE.md
 .claude
+# superpowers plans / specs
+docs/superpowers/
